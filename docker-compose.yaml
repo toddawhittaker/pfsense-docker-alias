@@ -1,0 +1,26 @@
+services:
+  pfsense-docker-alias:
+    # The Docker image name. Build it with `docker build -t pfsense-docker-alias .`
+    image: pfsense-docker-alias:latest
+    
+    # The name of the container for easier identification
+    container_name: pfsense-docker-alias
+
+    environment:
+      # REQUIRED environment variables
+      # The fully qualified domain name of your pfSense instance
+      PFSENSE_HOSTNAME: "pfsense.lab.internal"
+      
+      # API token for authenticating with pfSense
+      PFSENSE_API_TOKEN: "your_secure_api_token"
+      
+      # OPTIONAL environment variables
+      # Uncomment to scan and add aliases for existing containers on startup
+      # ADD_ALIASES_ON_STARTUP: "true"
+      
+    volumes:
+      # Mount the Docker socket for listening to container events
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # Ensure the service restarts automatically unless explicitly stopped
+    restart: unless-stopped

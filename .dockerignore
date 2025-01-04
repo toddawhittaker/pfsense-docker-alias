@@ -1,0 +1,9 @@
+README.md
+LICENSE
+.git
+.dockerignore
+.gitignore
+docker-compose.yaml
+.vscode
+.venv
+test.sh
