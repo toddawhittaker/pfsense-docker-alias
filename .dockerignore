@@ -1,9 +1,10 @@
 README.md
 LICENSE
-.git
+.git/
 .dockerignore
 .gitignore
 docker-compose.yaml
 .vscode
 .venv
 test.sh
+.github/

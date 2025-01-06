@@ -160,11 +160,12 @@ Use these environment variables in your `docker-compose.yaml` or `docker run` co
 ### Docker Labels
 Use these labels on your services to automatically generate aliases in pfSense DNS.
 
-| Label Name                   | Required | Description                                              |
-|------------------------------|----------|----------------------------------------------------------|
+| Label Name                   | Required | Description                                                           |
+|------------------------------|----------|-----------------------------------------------------------------------|
 | `pfsense.dns.override`       | Yes      | The **existing** DNS host override in pfSense to associate the alias. |
-| `pfsense.dns.alias`          | Yes      | The DNS alias to add for this container.                 |
-| `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops.               |
+| `pfsense.dns.alias`          | Yes      | The DNS alias to add for this container.                              |
+| `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops.                            |
+| `pfsense.dns.description`    | No       | Description for the alias                                             |
 
 ## Example `docker-compose.yaml` configuring an NGINX web server 🐳
 The following example demonstrates how to use the labels for automatically creating aliases. Note that the host override must currently exist in pfSense.
