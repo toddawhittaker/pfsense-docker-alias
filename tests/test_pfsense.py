@@ -1,4 +1,5 @@
 import requests
+import logging
 
 from pfsense import PFSense
 
@@ -96,6 +97,25 @@ def test_get_all_host_overrides_returns_empty_list_on_request_errors(monkeypatch
     client = PFSense("pfsense.lab.internal", "secret-token")
 
     assert client.get_all_host_overrides() == []
+
+
+def test_http_error_logs_status_without_response_body(monkeypatch, caplog):
+    response = FakeResponse()
+    response.text = "sensitive response body"
+    error = requests.HTTPError("request failed")
+    error.response = response
+    monkeypatch.setattr(
+        "pfsense.requests.get",
+        lambda **_kwargs: FakeResponse(error=error),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "HTTP Status Code: 500" in caplog.text
+    assert "sensitive response body" not in caplog.text
 
 
 def test_get_all_host_overrides_returns_empty_list_on_network_errors(monkeypatch):

@@ -1,4 +1,5 @@
 import importlib
+import logging
 import sys
 import types
 
@@ -93,6 +94,13 @@ def test_parse_alias_labels_ignores_incomplete_labels(monkeypatch):
     assert main.parse_alias_labels({"pfsense.dns.alias": "nginx.lab.internal"}) is None
 
 
+def test_get_container_labels_returns_empty_dict_for_null_labels(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    container = types.SimpleNamespace(attrs={"Config": {"Labels": None}})
+
+    assert main.get_container_labels(container) == {}
+
+
 def test_get_alias_event_action_handles_start_and_stop(monkeypatch):
     main, _fake_client = load_main(monkeypatch)
     labels = {
@@ -147,6 +155,33 @@ def test_handle_container_event_dispatches_start(monkeypatch):
     assert calls == [("caddy.lab.internal", "nginx.lab.internal", "nginx service")]
 
 
+def test_handle_container_event_ignores_missing_container_id(monkeypatch, caplog):
+    main, _fake_client = load_main(monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {}, "Action": "start"})
+
+    assert "missing container ID" in caplog.text
+
+
+def test_main_loop_ignores_malformed_events(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    handled_events = []
+    fake_client.events = lambda decode=True: iter(
+        [
+            {},
+            {"Type": "container"},
+            {"Type": "network", "Action": "start"},
+            {"Type": "container", "Action": "start"},
+        ]
+    )
+    monkeypatch.setattr(main, "handle_container_event", handled_events.append)
+
+    main.main()
+
+    assert handled_events == [{"Type": "container", "Action": "start"}]
+
+
 def test_handle_container_event_dispatches_stop_when_enabled(monkeypatch):
     main, fake_client = load_main(monkeypatch)
     calls = []
@@ -171,3 +206,15 @@ def test_handle_container_event_dispatches_stop_when_enabled(monkeypatch):
     main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
 
     assert calls == [("caddy.lab.internal", "nginx.lab.internal")]
+
+
+def test_run_exits_nonzero_on_unexpected_exception(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    monkeypatch.setattr(main, "main", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    try:
+        main.run()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("run() did not exit")

@@ -95,7 +95,6 @@ class PFSense:
         logger.error(f"API call failed during '{context}': {error}")
         if isinstance(error, requests.HTTPError):
             logger.error(f"HTTP Status Code: {error.response.status_code}")
-            logger.error(f"Response Content: {error.response.text}")
 
     def get_all_host_overrides(self):
         """Returns all the host overrides defined in pfSense"""

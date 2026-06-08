@@ -99,8 +99,8 @@ signal.signal(signal.SIGTERM, cleanup)
 def get_container_labels(container):
     """Fetch labels from a Docker container."""
     try:
-        return container.attrs['Config']['Labels']
-    except KeyError:
+        return container.attrs['Config']['Labels'] or {}
+    except (KeyError, TypeError):
         return {}
 
 def parse_alias_labels(labels):
@@ -136,8 +136,13 @@ def get_alias_event_action(event_action, labels):
 
 def handle_container_event(event):
     """Handle a Docker container start/stop event."""
+    container_id = event.get('Actor', {}).get('ID')
+    if not container_id:
+        logger.warning("Ignoring container event with missing container ID.")
+        return
+
     try:
-        container = client.containers.get(event['Actor']['ID'])
+        container = client.containers.get(container_id)
     except docker.errors.NotFound as e:
         logger.warning(f"Container not found: {e}")
         return
@@ -147,7 +152,7 @@ def handle_container_event(event):
 
     labels = get_container_labels(container)
 
-    alias_action = get_alias_event_action(event['Action'], labels)
+    alias_action = get_alias_event_action(event.get('Action'), labels)
     if not alias_action:
         return
 
@@ -191,13 +196,18 @@ def main():
     try:
         logger.info("Listening for container start/stop events.")
         for event in client.events(decode=True):
-            if event['Type'] == 'container' and event['Action'] in ['start', 'stop']:
+            if event.get('Type') == 'container' and event.get('Action') in ['start', 'stop']:
                 handle_container_event(event)
     except docker.errors.DockerException as e:
         _handle_error(e, "main")
 
-if __name__ == "__main__":
+def run():
+    """Run the service and exit non-zero on unexpected failures."""
     try:
         main()
     except Exception as e:  # pylint: disable=broad-except
         _handle_error(e, "main")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    run()

@@ -75,7 +75,7 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
          container_name: pfsense-docker-alias
          environment:
            PFSENSE_HOSTNAME: "pfsense.lab.internal"
-           PFSENSE_API_TOKEN: "your_secure_api_token"
+           PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN}"
            # Keep TLS verification enabled by default. For self-signed certs,
            # mount a CA bundle and set PFSENSE_CA_BUNDLE to its container path.
            # PFSENSE_VERIFY_SSL: "true"
@@ -109,7 +109,7 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
 docker run \
   --name pfsense-docker-alias \
   -e PFSENSE_HOSTNAME="pfsense.lab.internal" \
-  -e PFSENSE_API_TOKEN="your_secure_api_token" \
+  -e PFSENSE_API_TOKEN \
   -e PFSENSE_VERIFY_SSL="true" \
   -e ADD_ALIASES_ON_STARTUP="false" \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -118,9 +118,11 @@ docker run \
 
 ### Notes 📝
 
-- Ensure the required environment variables (`PFSENSE_HOSTNAME`, `PFSENSE_API_TOKEN`) are correctly set in your `docker-compose.yaml` file.
+- Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`.
+- Ensure the required environment variables (`PFSENSE_HOSTNAME`, `PFSENSE_API_TOKEN`) are correctly set.
 - If using `ADD_ALIASES_ON_STARTUP`, ensure all existing containers are labeled correctly before starting the service.
 - Replace `pfsense.lab.internal` with the fully qualified hostname or IP address of your pfSense firewall.
+- Mounting `/var/run/docker.sock` gives this service broad access to the Docker host. Run it only on trusted hosts and with a pfSense API token scoped as narrowly as your installation allows.
 
 
 ### Or Build it Yourself 🚀
