@@ -8,3 +8,5 @@ docker-compose.yaml
 .venv
 test.sh
 .github/
+AGENTS.md
+.codex/
