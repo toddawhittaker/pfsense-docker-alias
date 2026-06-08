@@ -10,8 +10,8 @@ This container is perfect for dynamic environments where services are deployed u
 
 Managing DNS entries for services running in Docker can be a pain, especially in environments where services frequently change. This project simplifies the process by:
 - ✅ Automatically adding DNS aliases to a specified host override in pfSense when containers start.
-- ❌ Optionally removing aliases when containers stop.
-- 🔄 Optionally syncing aliases for all existing containers on startup.
+- ❌ Optionally removing aliases when containers stop or exit.
+- 🔄 Optionally adding aliases for currently running containers on startup.
 
 By leveraging the unofficial [pfSense REST API](https://pfrest.org/), this container ensures DNS records stay in sync with your Docker services.
 
@@ -40,7 +40,7 @@ With **pfSense Docker Alias**, the **last step** is automated! Simply label your
 ## Features ✨
 
 - **Dynamic DNS Alias Management**: Automatically add and remove DNS aliases for Docker containers.
-- **Startup Alias Sync**: Optionally scans all existing containers and ensures aliases are present in pfSense.
+- **Startup Alias Sync**: Optionally scans currently running containers and ensures aliases are present in pfSense.
 - **Highly Configurable**: Flexible environment variables and Docker labels.
 - **Lightweight**: Built on an Alpine-based Python image for minimal resource usage.
 - **Secure**: Requires API key-based authentication for pfSense.
@@ -79,11 +79,13 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
            # Keep TLS verification enabled by default. For self-signed certs,
            # mount a CA bundle and set PFSENSE_CA_BUNDLE to its container path.
            # PFSENSE_VERIFY_SSL: "true"
-           # PFSENSE_CA_BUNDLE: "/path/to/ca.pem"
+           # PFSENSE_CA_BUNDLE: "/etc/ssl/certs/pfsense-ca.pem"
            # Uncomment to enable scanning for aliases on startup
            # ADD_ALIASES_ON_STARTUP: "true"
          volumes:
            - /var/run/docker.sock:/var/run/docker.sock
+           # Uncomment when using PFSENSE_CA_BUNDLE
+           # - ./pfsense-ca.pem:/etc/ssl/certs/pfsense-ca.pem:ro
          restart: unless-stopped
      ```
 
@@ -120,7 +122,7 @@ docker run \
 
 - Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`.
 - Ensure the required environment variables (`PFSENSE_HOSTNAME`, `PFSENSE_API_TOKEN`) are correctly set.
-- If using `ADD_ALIASES_ON_STARTUP`, ensure all existing containers are labeled correctly before starting the service.
+- If using `ADD_ALIASES_ON_STARTUP`, ensure all currently running containers are labeled correctly before starting the service. Startup sync is additive and does not prune stale aliases.
 - Replace `pfsense.lab.internal` with the fully qualified hostname or IP address of your pfSense firewall.
 - Mounting `/var/run/docker.sock` gives this service broad access to the Docker host. Run it only on trusted hosts and with a pfSense API token scoped as narrowly as your installation allows.
 
@@ -164,7 +166,7 @@ Use these environment variables in your `docker-compose.yaml` or `docker run` co
 | `PFSENSE_API_TOKEN`      | Yes      | None    | API token for authenticating with pfSense.            |
 | `PFSENSE_VERIFY_SSL`     | No       | `true`  | Validate the pfSense HTTPS certificate. Set to `false` only if certificate validation is not possible. |
 | `PFSENSE_CA_BUNDLE`      | No       | None    | Path inside the container to a custom CA bundle for pfSense certificate validation. |
-| `ADD_ALIASES_ON_STARTUP` | No       | `false` | Enable scanning for aliases on startup.               |
+| `ADD_ALIASES_ON_STARTUP` | No       | `false` | Add aliases for currently running labeled containers on startup. |
 
 ### Docker Labels
 Use these labels on your services to automatically generate aliases in pfSense DNS.
@@ -173,7 +175,7 @@ Use these labels on your services to automatically generate aliases in pfSense D
 |------------------------------|----------|-----------------------------------------------------------------------|
 | `pfsense.dns.override`       | Yes      | The **existing** DNS host override in pfSense to associate the alias. |
 | `pfsense.dns.alias`          | Yes      | The DNS alias to add for this container.                              |
-| `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops. Must be exactly `true`.    |
+| `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops or exits. Must be exactly `true`. |
 | `pfsense.dns.description`    | No       | Description for the alias                                             |
 
 ## Example `docker-compose.yaml` configuring an NGINX web server 🐳

@@ -19,7 +19,7 @@ services:
       # PFSENSE_VERIFY_SSL: "true"
       #
       # Path inside the container to a custom CA bundle for pfSense TLS validation
-      # PFSENSE_CA_BUNDLE: "/path/to/ca.pem"
+      # PFSENSE_CA_BUNDLE: "/etc/ssl/certs/pfsense-ca.pem"
       #
       # Uncomment to scan and add aliases for existing containers on startup
       # ADD_ALIASES_ON_STARTUP: "true"
@@ -27,6 +27,8 @@ services:
     volumes:
       # Mount the Docker socket for listening to container events
       - /var/run/docker.sock:/var/run/docker.sock
+      # Uncomment when using PFSENSE_CA_BUNDLE
+      # - ./pfsense-ca.pem:/etc/ssl/certs/pfsense-ca.pem:ro
 
     # Ensure the service restarts automatically unless explicitly stopped
     restart: unless-stopped

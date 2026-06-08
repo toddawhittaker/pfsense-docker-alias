@@ -129,7 +129,7 @@ def get_alias_event_action(event_action, labels):
     if event_action == 'start':
         return "add", alias_config
 
-    if event_action == 'stop' and alias_config["remove_on_stop"]:
+    if event_action in ['stop', 'die'] and alias_config["remove_on_stop"]:
         return "remove", alias_config
 
     return None
@@ -196,10 +196,11 @@ def main():
     try:
         logger.info("Listening for container start/stop events.")
         for event in client.events(decode=True):
-            if event.get('Type') == 'container' and event.get('Action') in ['start', 'stop']:
+            if event.get('Type') == 'container' and event.get('Action') in ['start', 'stop', 'die']:
                 handle_container_event(event)
     except docker.errors.DockerException as e:
         _handle_error(e, "main")
+        raise
 
 def run():
     """Run the service and exit non-zero on unexpected failures."""

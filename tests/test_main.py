@@ -118,6 +118,20 @@ def test_get_alias_event_action_handles_start_and_stop(monkeypatch):
     assert stop_action[1]["host_override_fqdn"] == "caddy.lab.internal"
 
 
+def test_get_alias_event_action_handles_die_as_remove(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    labels = {
+        "pfsense.dns.override": "caddy.lab.internal",
+        "pfsense.dns.alias": "nginx.lab.internal",
+        "pfsense.dns.remove_on_stop": "true",
+    }
+
+    action = main.get_alias_event_action("die", labels)
+
+    assert action[0] == "remove"
+    assert action[1]["alias_fqdn"] == "nginx.lab.internal"
+
+
 def test_get_alias_event_action_requires_exact_remove_on_stop_value(monkeypatch):
     main, _fake_client = load_main(monkeypatch)
     labels = {
@@ -173,13 +187,63 @@ def test_main_loop_ignores_malformed_events(monkeypatch):
             {"Type": "container"},
             {"Type": "network", "Action": "start"},
             {"Type": "container", "Action": "start"},
+            {"Type": "container", "Action": "die"},
         ]
     )
     monkeypatch.setattr(main, "handle_container_event", handled_events.append)
 
     main.main()
 
-    assert handled_events == [{"Type": "container", "Action": "start"}]
+    assert handled_events == [
+        {"Type": "container", "Action": "start"},
+        {"Type": "container", "Action": "die"},
+    ]
+
+
+def test_main_loop_reraises_docker_event_errors(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+
+    def fail_events(decode=True):
+        assert decode is True
+        raise DockerException("event stream failed")
+
+    fake_client.events = fail_events
+
+    try:
+        main.main()
+    except DockerException:
+        pass
+    else:
+        raise AssertionError("main() did not raise DockerException")
+
+
+def test_add_aliases_on_startup_adds_labeled_running_containers(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    calls = []
+    fake_client.containers.list = lambda: [
+        types.SimpleNamespace(
+            name="nginx",
+            attrs={
+                "Config": {
+                    "Labels": {
+                        "pfsense.dns.override": "caddy.lab.internal",
+                        "pfsense.dns.alias": "nginx.lab.internal",
+                        "pfsense.dns.description": "nginx service",
+                    }
+                }
+            },
+        ),
+        types.SimpleNamespace(name="unlabeled", attrs={"Config": {"Labels": {}}}),
+    ]
+    main.NAMESERVER = types.SimpleNamespace(
+        add_host_override_alias=lambda host_override, alias, description: calls.append(
+            (host_override, alias, description)
+        )
+    )
+
+    main.add_aliases_on_startup()
+
+    assert calls == [("caddy.lab.internal", "nginx.lab.internal", "nginx service")]
 
 
 def test_handle_container_event_dispatches_stop_when_enabled(monkeypatch):
@@ -204,6 +268,32 @@ def test_handle_container_event_dispatches_stop_when_enabled(monkeypatch):
     )
 
     main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
+
+    assert calls == [("caddy.lab.internal", "nginx.lab.internal")]
+
+
+def test_handle_container_event_dispatches_die_when_remove_on_stop_enabled(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    calls = []
+    fake_client.container = types.SimpleNamespace(
+        name="nginx",
+        attrs={
+            "Config": {
+                "Labels": {
+                    "pfsense.dns.override": "caddy.lab.internal",
+                    "pfsense.dns.alias": "nginx.lab.internal",
+                    "pfsense.dns.remove_on_stop": "true",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "process_stop_event",
+        lambda host_override, alias: calls.append((host_override, alias)),
+    )
+
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "die"})
 
     assert calls == [("caddy.lab.internal", "nginx.lab.internal")]
 

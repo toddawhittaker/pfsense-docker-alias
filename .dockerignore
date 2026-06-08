@@ -11,3 +11,5 @@ test.sh
 AGENTS.md
 .codex/
 .codex
+requirements-dev.txt
+tests/

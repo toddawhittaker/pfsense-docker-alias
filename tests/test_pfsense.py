@@ -129,6 +129,24 @@ def test_get_all_host_overrides_returns_empty_list_on_network_errors(monkeypatch
     assert client.get_all_host_overrides() == []
 
 
+def test_get_all_host_overrides_retries_transient_network_errors(monkeypatch):
+    calls = []
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        calls.append("get")
+        if len(calls) == 1:
+            raise requests.ConnectionError("temporary failure")
+        return FakeResponse({"data": [{"host": "caddy", "domain": "lab.internal"}]})
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.get_all_host_overrides() == [{"host": "caddy", "domain": "lab.internal"}]
+    assert calls == ["get", "get"]
+
+
 def test_get_all_host_overrides_returns_empty_list_on_invalid_json(monkeypatch):
     class InvalidJsonResponse(FakeResponse):
         def json(self):
@@ -224,6 +242,32 @@ def test_add_host_override_alias_returns_false_when_api_post_fails(monkeypatch):
     assert not client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
 
 
+def test_add_host_override_alias_returns_false_when_apply_fails(monkeypatch):
+    calls = []
+
+    def fake_post(**_kwargs):
+        calls.append("post")
+        if len(calls) >= 2:
+            raise requests.ConnectionError("apply failed")
+        return FakeResponse()
+
+    monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [],
+        }
+    ]
+
+    assert not client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+    assert calls == ["post", "post", "post", "post"]
+
+
 def test_add_host_override_alias_returns_false_for_malformed_alias_fqdn(monkeypatch):
     client = PFSense("pfsense.lab.internal", "secret-token")
     client.get_all_host_overrides = lambda: [
@@ -236,6 +280,24 @@ def test_add_host_override_alias_returns_false_for_malformed_alias_fqdn(monkeypa
     ]
 
     assert not client.add_host_override_alias("caddy.lab.internal", "nginx")
+
+
+def test_add_host_override_alias_rejects_hostile_fqdn_values(monkeypatch):
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [],
+        }
+    ]
+
+    assert not client.add_host_override_alias("caddy.lab.internal", "bad alias.lab.internal")
+    assert not client.add_host_override_alias("caddy.lab.internal", "bad\nalias.lab.internal")
+    assert not client.add_host_override_alias("caddy.lab.internal", "bad..alias.lab.internal")
+    assert not client.add_host_override_alias("caddy.lab.internal", "-bad.lab.internal")
+    assert not client.add_host_override_alias("caddy.lab.internal", "bad-.lab.internal")
 
 
 def test_del_host_override_alias_constructs_delete_and_apply_requests(monkeypatch):
@@ -320,3 +382,41 @@ def test_del_host_override_alias_returns_false_for_malformed_host_override_fqdn(
     client = PFSense("pfsense.lab.internal", "secret-token")
 
     assert not client.del_host_override_alias("caddy", "nginx.lab.internal")
+
+
+def test_del_host_override_alias_returns_false_when_apply_fails(monkeypatch):
+    delete_calls = []
+    post_calls = []
+
+    def fake_delete(**_kwargs):
+        delete_calls.append("delete")
+        return FakeResponse()
+
+    def fake_post(**_kwargs):
+        post_calls.append("post")
+        raise requests.ConnectionError("apply failed")
+
+    monkeypatch.setattr("pfsense.requests.delete", fake_delete)
+    monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [
+                {
+                    "id": 34,
+                    "parent_id": 12,
+                    "host": "nginx",
+                    "domain": "lab.internal",
+                }
+            ],
+        }
+    ]
+
+    assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+    assert delete_calls == ["delete"]
+    assert post_calls == ["post", "post", "post"]

@@ -15,9 +15,9 @@ The class ensures robust error handling, logs failures without crashing the appl
 and supports secure API interactions using the pfSense API key.
 
 Dependencies:
-- Python 3.7 or newer
+- Python 3.12 in the provided Docker image
 - Requests library for HTTP requests
-- urllib3 for managing secure (self-signed) API interactions
+- urllib3 for TLS warning management when verification is explicitly disabled
 
 Usage:
 - Create an instance of the `PFSense` class by providing the pfSense hostname and API key.
@@ -50,6 +50,8 @@ pfsense.del_host_override_alias(
  # pylint: disable=logging-fstring-interpolation
 
 import logging
+import re
+import time
 import urllib3
 import requests
 
@@ -58,6 +60,10 @@ from urllib3.exceptions import InsecureRequestWarning
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+API_REQUEST_ATTEMPTS = 3
+API_RETRY_DELAY_SECONDS = 1
+DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 class PFSense:
     """
@@ -70,21 +76,43 @@ class PFSense:
         if self.verify_ssl is False:
             urllib3.disable_warnings(InsecureRequestWarning)
         logger.info(f"pfSense host set to {self.pfsense_host}")
-        #print(f'pfsense host set to {self.pfsense_host}')
 
     def _split_fqdn(self, fqdn, context):
         """Split a fully qualified domain name into host and domain parts."""
-        try:
-            host, domain = fqdn.split('.', 1)
-        except ValueError:
+        if not isinstance(fqdn, str):
+            logger.warning(f"Invalid FQDN during {context}.")
+            return None
+
+        labels = fqdn.split('.')
+        if len(labels) < 2 or any(not label for label in labels):
             logger.warning(f"Invalid FQDN '{fqdn}' during {context}.")
             return None
 
-        if not host or not domain:
-            logger.warning(f"Invalid FQDN '{fqdn}' during {context}.")
+        if not all(DNS_LABEL_PATTERN.fullmatch(label) for label in labels):
+            logger.warning("Invalid FQDN label during %s.", context)
             return None
 
-        return host, domain
+        return labels[0], '.'.join(labels[1:])
+
+    def _request(self, method, context, **kwargs):
+        """Run a pfSense API request with a small retry budget for transient failures."""
+        for attempt in range(1, API_REQUEST_ATTEMPTS + 1):
+            try:
+                return method(**kwargs)
+            except requests.RequestException as e:
+                if attempt == API_REQUEST_ATTEMPTS:
+                    self._handle_api_error(e, context)
+                    return None
+
+                logger.warning(
+                    "API call failed during '%s' attempt %s/%s; retrying.",
+                    context,
+                    attempt,
+                    API_REQUEST_ATTEMPTS
+                )
+                time.sleep(API_RETRY_DELAY_SECONDS)
+
+        return None
 
     def _handle_api_error(self, error, context=""):
         """
@@ -105,12 +133,16 @@ class PFSense:
         }
         # Fetch existing host overrides to find the one to update
         try:
-            response = requests.get(
+            response = self._request(
+                requests.get,
+                "get_all_host_overrides",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_overrides',
                 headers=headers,
                 verify=self.verify_ssl,
                 timeout=10
             )
+            if response is None:
+                return []
             response.raise_for_status()
             return response.json().get('data', [])
         except (requests.RequestException, ValueError) as e:
@@ -163,25 +195,22 @@ class PFSense:
         :param alias_descr: Description for the alias (optional).
         :return: True if the alias was added, False otherwise
         """
-    
-        alias = self.find_host_name(alias_fqdn)
-        if alias is not None:
-            logger.warning(f"Alias {alias_fqdn} already mapped to {alias['host']}.{alias['domain']}.")
-            #print(f'Could not add alias {alias_fqdn} to {host_override_fqdn} because it is already mapped to {alias["host"] + "." + alias["domain"]}.')
-            return False
-
-        host_override = self.find_host_name(host_override_fqdn)
-        if not host_override:
-            logger.warning(f"Host override {host_override_fqdn} not found.")
-            #print(f'Could not add alias {alias_fqdn} to {host_override_fqdn} because the host override was not found.')
-            return False
-
         split_fqdn = self._split_fqdn(alias_fqdn, "add_host_override_alias")
         if not split_fqdn:
             return False
 
         alias_host, alias_domain = split_fqdn
-        
+
+        alias = self.find_host_name(alias_fqdn)
+        if alias is not None:
+            logger.warning(f"Alias {alias_fqdn} already mapped to {alias['host']}.{alias['domain']}.")
+            return False
+
+        host_override = self.find_host_name(host_override_fqdn)
+        if not host_override:
+            logger.warning(f"Host override {host_override_fqdn} not found.")
+            return False
+
         # Define the headers for authentication
         headers = {
             'X-API-Key': f"{self.pfsense_api_key}",
@@ -196,24 +225,31 @@ class PFSense:
         }
         try:
             # Create new alias
-            response = requests.post(
+            response = self._request(
+                requests.post,
+                "add_host_override_alias",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
                 headers=headers,
                 verify=self.verify_ssl,
                 timeout=10,
                 json=data
             )
+            if response is None:
+                return False
             response.raise_for_status()
 
             # Apply changes
-            response = requests.post(
+            response = self._request(
+                requests.post,
+                "add_host_override_alias_apply",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
                 headers=headers,
                 verify=self.verify_ssl,
                 timeout=10
             )
+            if response is None:
+                return False
             response.raise_for_status()
-            #print(f'Added alias {alias_fqdn} to host override {host_override_fqdn}.')
             logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
             return True
 
@@ -225,13 +261,11 @@ class PFSense:
         host_override = self.find_host_name(host_override_fqdn)
         if not host_override:
             logger.warning(f"Host override {host_override_fqdn} not found.")
-            #print(f'Could not remove alias {alias_fqdn} from {host_override_fqdn} because the host override was not found.')
             return False
         
         alias = self.find_alias_in_host_override(host_override, alias_fqdn)
         if not alias:
             logger.warning(f"Alias {alias_fqdn} not found in host override {host_override_fqdn}.")
-            #print(f'Could not remove alias {alias_fqdn} because is not associated with {host_override_fqdn}.')
             return False
         
         headers = {
@@ -246,25 +280,32 @@ class PFSense:
 
         try:
             # Remove alias
-            response = requests.delete(
+            response = self._request(
+                requests.delete,
+                "del_host_override_alias",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
                 headers=headers,
                 verify=self.verify_ssl,
                 timeout=10,
                 json=data
             )
+            if response is None:
+                return False
             response.raise_for_status()
 
             # Apply changes
-            response = requests.post(
+            response = self._request(
+                requests.post,
+                "del_host_override_alias_apply",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
                 headers=headers,
                 verify=self.verify_ssl,
                 timeout=10
             )
+            if response is None:
+                return False
             response.raise_for_status()
             logger.info(f"Alias {alias_fqdn} removed from host override {host_override_fqdn}.")
-            #print(f'Removed alias {alias_fqdn} from host override {host_override_fqdn}.')
             return True
 
         except requests.RequestException as e:
