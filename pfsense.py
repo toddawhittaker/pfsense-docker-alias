@@ -50,13 +50,10 @@ pfsense.del_host_override_alias(
  # pylint: disable=logging-fstring-interpolation
 
 import logging
-import requests
 import urllib3
+import requests
 
 from urllib3.exceptions import InsecureRequestWarning
-
-# Disable insecure (self-signed certs) request warnings
-urllib3.disable_warnings(InsecureRequestWarning)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,11 +63,28 @@ class PFSense:
     """
     An abstraction of the pfSense server.
     """
-    def __init__(self, pfsense_host, pfsense_api_key):
+    def __init__(self, pfsense_host, pfsense_api_key, verify_ssl=True, ca_bundle=None):
         self.pfsense_host = pfsense_host
         self.pfsense_api_key = pfsense_api_key
+        self.verify_ssl = ca_bundle if ca_bundle else verify_ssl
+        if self.verify_ssl is False:
+            urllib3.disable_warnings(InsecureRequestWarning)
         logger.info(f"pfSense host set to {self.pfsense_host}")
         #print(f'pfsense host set to {self.pfsense_host}')
+
+    def _split_fqdn(self, fqdn, context):
+        """Split a fully qualified domain name into host and domain parts."""
+        try:
+            host, domain = fqdn.split('.', 1)
+        except ValueError:
+            logger.warning(f"Invalid FQDN '{fqdn}' during {context}.")
+            return None
+
+        if not host or not domain:
+            logger.warning(f"Invalid FQDN '{fqdn}' during {context}.")
+            return None
+
+        return host, domain
 
     def _handle_api_error(self, error, context=""):
         """
@@ -95,12 +109,12 @@ class PFSense:
             response = requests.get(
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_overrides',
                 headers=headers,
-                verify=False,
+                verify=self.verify_ssl,
                 timeout=10
             )
             response.raise_for_status()
             return response.json().get('data', [])
-        except requests.HTTPError as e:
+        except (requests.RequestException, ValueError) as e:
             self._handle_api_error(e, "get_all_host_overrides")
             return []
 
@@ -110,7 +124,11 @@ class PFSense:
         :parameter fqdn: a fully qualified hostname and domain string
         :return: a host override object representing the host or the alias or None if not found
         """
-        host, domain = fqdn.split('.', 1)
+        split_fqdn = self._split_fqdn(fqdn, "find_host_name")
+        if not split_fqdn:
+            return None
+
+        host, domain = split_fqdn
         host_overrides = self.get_all_host_overrides()
         for host_override in host_overrides:
             if host_override['host'] == host and host_override['domain'] == domain:
@@ -126,7 +144,11 @@ class PFSense:
         :parameter alias_fqdn: a fully qualified hostname and domain string alias
         :return: an alias object if found in the host override or None if not found
         """
-        alias_host, alias_domain = alias_fqdn.split('.', 1)
+        split_fqdn = self._split_fqdn(alias_fqdn, "find_alias_in_host_override")
+        if not split_fqdn:
+            return None
+
+        alias_host, alias_domain = split_fqdn
 
         alias = None
         if 'aliases' in host_override and host_override['aliases']:
@@ -155,7 +177,11 @@ class PFSense:
             #print(f'Could not add alias {alias_fqdn} to {host_override_fqdn} because the host override was not found.')
             return False
 
-        alias_host, alias_domain = alias_fqdn.split('.', 1)
+        split_fqdn = self._split_fqdn(alias_fqdn, "add_host_override_alias")
+        if not split_fqdn:
+            return False
+
+        alias_host, alias_domain = split_fqdn
         
         # Define the headers for authentication
         headers = {
@@ -174,7 +200,7 @@ class PFSense:
             response = requests.post(
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
                 headers=headers,
-                verify=False,
+                verify=self.verify_ssl,
                 timeout=10,
                 json=data
             )
@@ -184,7 +210,7 @@ class PFSense:
             response = requests.post(
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
                 headers=headers,
-                verify=False,
+                verify=self.verify_ssl,
                 timeout=10
             )
             response.raise_for_status()
@@ -192,7 +218,7 @@ class PFSense:
             logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
             return True
 
-        except requests.HTTPError as e:
+        except requests.RequestException as e:
             self._handle_api_error(e, "add_host_override_alias")
             return False
 
@@ -224,7 +250,7 @@ class PFSense:
             response = requests.delete(
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
                 headers=headers,
-                verify=False,
+                verify=self.verify_ssl,
                 timeout=10,
                 json=data
             )
@@ -234,7 +260,7 @@ class PFSense:
             response = requests.post(
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
                 headers=headers,
-                verify=False,
+                verify=self.verify_ssl,
                 timeout=10
             )
             response.raise_for_status()
@@ -242,7 +268,7 @@ class PFSense:
             #print(f'Removed alias {alias_fqdn} from host override {host_override_fqdn}.')
             return True
 
-        except requests.HTTPError as e:
+        except requests.RequestException as e:
             self._handle_api_error(e, "del_host_override_alias")
             return False
         

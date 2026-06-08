@@ -41,6 +41,8 @@ def get_env_var(var_name):
 
 PFSENSE_HOSTNAME = get_env_var("PFSENSE_HOSTNAME")
 PFSENSE_API_TOKEN = get_env_var("PFSENSE_API_TOKEN")
+PFSENSE_VERIFY_SSL = os.getenv("PFSENSE_VERIFY_SSL", "true").lower() != "false"
+PFSENSE_CA_BUNDLE = os.getenv("PFSENSE_CA_BUNDLE")
 ADD_ALIASES_ON_STARTUP = os.getenv("ADD_ALIASES_ON_STARTUP", "false").lower() == "true"
 
 # Initialize Docker client
@@ -176,7 +178,12 @@ def main():
     """Main program loop to listen for Docker events."""
     logger.info("pfsense-docker-alias started")
     global NAMESERVER  # pylint: disable=global-statement
-    NAMESERVER = pfsense.PFSense(PFSENSE_HOSTNAME, PFSENSE_API_TOKEN)
+    NAMESERVER = pfsense.PFSense(
+        PFSENSE_HOSTNAME,
+        PFSENSE_API_TOKEN,
+        verify_ssl=PFSENSE_VERIFY_SSL,
+        ca_bundle=PFSENSE_CA_BUNDLE
+    )
 
     if ADD_ALIASES_ON_STARTUP:
         add_aliases_on_startup()

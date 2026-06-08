@@ -28,7 +28,7 @@ class FakeDockerClient:
         self.closed = True
 
 
-def load_main(monkeypatch):
+def load_main(monkeypatch, verify_ssl=None, ca_bundle=None):
     fake_client = FakeDockerClient()
     fake_docker = types.SimpleNamespace(
         from_env=lambda: fake_client,
@@ -37,6 +37,16 @@ def load_main(monkeypatch):
 
     monkeypatch.setenv("PFSENSE_HOSTNAME", "pfsense.lab.internal")
     monkeypatch.setenv("PFSENSE_API_TOKEN", "test-token")
+    if verify_ssl is None:
+        monkeypatch.delenv("PFSENSE_VERIFY_SSL", raising=False)
+    else:
+        monkeypatch.setenv("PFSENSE_VERIFY_SSL", verify_ssl)
+
+    if ca_bundle is None:
+        monkeypatch.delenv("PFSENSE_CA_BUNDLE", raising=False)
+    else:
+        monkeypatch.setenv("PFSENSE_CA_BUNDLE", ca_bundle)
+
     monkeypatch.setitem(sys.modules, "docker", fake_docker)
     sys.modules.pop("main", None)
 
@@ -62,6 +72,17 @@ def test_parse_alias_labels_returns_alias_config(monkeypatch):
         "alias_descr": "nginx service",
         "remove_on_stop": True,
     }
+
+
+def test_tls_verification_env_defaults_to_true_and_only_false_disables(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    assert main.PFSENSE_VERIFY_SSL is True
+
+    main, _fake_client = load_main(monkeypatch, verify_ssl="not-a-bool")
+    assert main.PFSENSE_VERIFY_SSL is True
+
+    main, _fake_client = load_main(monkeypatch, verify_ssl="false")
+    assert main.PFSENSE_VERIFY_SSL is False
 
 
 def test_parse_alias_labels_ignores_incomplete_labels(monkeypatch):

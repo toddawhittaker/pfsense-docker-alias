@@ -15,6 +15,12 @@ services:
       PFSENSE_API_TOKEN: "your_secure_api_token"
       
       # OPTIONAL environment variables
+      # Set to "false" only if you cannot validate your pfSense certificate
+      # PFSENSE_VERIFY_SSL: "true"
+      #
+      # Path inside the container to a custom CA bundle for pfSense TLS validation
+      # PFSENSE_CA_BUNDLE: "/path/to/ca.pem"
+      #
       # Uncomment to scan and add aliases for existing containers on startup
       # ADD_ALIASES_ON_STARTUP: "true"
       

@@ -76,6 +76,10 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
          environment:
            PFSENSE_HOSTNAME: "pfsense.lab.internal"
            PFSENSE_API_TOKEN: "your_secure_api_token"
+           # Keep TLS verification enabled by default. For self-signed certs,
+           # mount a CA bundle and set PFSENSE_CA_BUNDLE to its container path.
+           # PFSENSE_VERIFY_SSL: "true"
+           # PFSENSE_CA_BUNDLE: "/path/to/ca.pem"
            # Uncomment to enable scanning for aliases on startup
            # ADD_ALIASES_ON_STARTUP: "true"
          volumes:
@@ -106,6 +110,7 @@ docker run \
   --name pfsense-docker-alias \
   -e PFSENSE_HOSTNAME="pfsense.lab.internal" \
   -e PFSENSE_API_TOKEN="your_secure_api_token" \
+  -e PFSENSE_VERIFY_SSL="true" \
   -e ADD_ALIASES_ON_STARTUP="false" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   ghcr.io/toddawhittaker/pfsense-docker-alias:latest
@@ -155,6 +160,8 @@ Use these environment variables in your `docker-compose.yaml` or `docker run` co
 |--------------------------|----------|---------|-------------------------------------------------------|
 | `PFSENSE_HOSTNAME`       | Yes      | None    | Fully qualified domain name of your pfSense instance. |
 | `PFSENSE_API_TOKEN`      | Yes      | None    | API token for authenticating with pfSense.            |
+| `PFSENSE_VERIFY_SSL`     | No       | `true`  | Validate the pfSense HTTPS certificate. Set to `false` only if certificate validation is not possible. |
+| `PFSENSE_CA_BUNDLE`      | No       | None    | Path inside the container to a custom CA bundle for pfSense certificate validation. |
 | `ADD_ALIASES_ON_STARTUP` | No       | `false` | Enable scanning for aliases on startup.               |
 
 ### Docker Labels
