@@ -90,19 +90,19 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
 3. **Start the Service**:
    - Run the following command to start the container:
      ```bash
-     docker-compose up -d
+     docker compose up -d
      ```
 
 4. **Verify Logs**:
    - Check the logs to confirm the container is running and communicating with pfSense:
      ```bash
-     docker-compose logs -f
+     docker compose logs -f
      ```
 
 5. **Stop the Service** (Optional):
    - If you need to stop the container:
      ```bash
-     docker-compose down
+     docker compose down
      ```
 #### Using `docker run`
 ```bash
@@ -144,13 +144,13 @@ Don't trust my image? Check out the git repo, inspect the source, and build it y
 
 4. **Start the Service**:
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
 
 5. **Check Logs**:
    Verify the service is running correctly:
    ```bash
-   docker-compose logs -f
+   docker compose logs -f
    ```
 
 ## Configuration 🔧
@@ -173,7 +173,7 @@ Use these labels on your services to automatically generate aliases in pfSense D
 |------------------------------|----------|-----------------------------------------------------------------------|
 | `pfsense.dns.override`       | Yes      | The **existing** DNS host override in pfSense to associate the alias. |
 | `pfsense.dns.alias`          | Yes      | The DNS alias to add for this container.                              |
-| `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops.                            |
+| `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops. Must be exactly `true`.    |
 | `pfsense.dns.description`    | No       | Description for the alias                                             |
 
 ## Example `docker-compose.yaml` configuring an NGINX web server 🐳
@@ -190,7 +190,7 @@ services:
     labels:
       - "pfsense.dns.override=caddy.lab.internal"
       - "pfsense.dns.alias=nginx.lab.internal"
-      - "pfsense.dns.description=My nginx websever"
+      - "pfsense.dns.description=My nginx webserver"
       - "pfsense.dns.remove_on_stop=true"
 ```
 ### Notes 📝
