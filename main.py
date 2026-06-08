@@ -18,6 +18,11 @@ import pfsense
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+LABEL_DNS_OVERRIDE = "pfsense.dns.override"
+LABEL_DNS_ALIAS = "pfsense.dns.alias"
+LABEL_DNS_DESCRIPTION = "pfsense.dns.description"
+LABEL_DNS_REMOVE_ON_STOP = "pfsense.dns.remove_on_stop"
+
 def _handle_error(error, context=""):
     """
     Logs detailed information about errors.
@@ -58,18 +63,17 @@ def add_aliases_on_startup():
 
     for container in containers:
         labels = get_container_labels(container)
+        alias_config = parse_alias_labels(labels)
 
-        host_override_fqdn = labels.get("pfsense.dns.override", None)
-        if not host_override_fqdn:
+        if not alias_config:
             continue
 
-        alias_fqdn = labels.get("pfsense.dns.alias", None)
-        if not alias_fqdn:
-            continue
-
-        alias_descr = labels.get('pfsense.dns.description', '')
-        logger.info(f"Adding alias '{alias_fqdn}' for container '{container.name}'")
-        NAMESERVER.add_host_override_alias(host_override_fqdn, alias_fqdn, alias_descr)
+        logger.info(f"Adding alias '{alias_config['alias_fqdn']}' for container '{container.name}'")
+        NAMESERVER.add_host_override_alias(
+            alias_config["host_override_fqdn"],
+            alias_config["alias_fqdn"],
+            alias_config["alias_descr"]
+        )
         found = True
 
     if not found:
@@ -97,6 +101,37 @@ def get_container_labels(container):
     except KeyError:
         return {}
 
+def parse_alias_labels(labels):
+    """Return alias configuration from Docker labels, or None if labels are incomplete."""
+    host_override_fqdn = labels.get(LABEL_DNS_OVERRIDE, None)
+    if not host_override_fqdn:
+        return None
+
+    alias_fqdn = labels.get(LABEL_DNS_ALIAS, None)
+    if not alias_fqdn:
+        return None
+
+    return {
+        "host_override_fqdn": host_override_fqdn,
+        "alias_fqdn": alias_fqdn,
+        "alias_descr": labels.get(LABEL_DNS_DESCRIPTION, ''),
+        "remove_on_stop": labels.get(LABEL_DNS_REMOVE_ON_STOP, None) == "true",
+    }
+
+def get_alias_event_action(event_action, labels):
+    """Return the alias action and config for a Docker event, or None if no action applies."""
+    alias_config = parse_alias_labels(labels)
+    if not alias_config:
+        return None
+
+    if event_action == 'start':
+        return "add", alias_config
+
+    if event_action == 'stop' and alias_config["remove_on_stop"]:
+        return "remove", alias_config
+
+    return None
+
 def handle_container_event(event):
     """Handle a Docker container start/stop event."""
     try:
@@ -110,22 +145,22 @@ def handle_container_event(event):
 
     labels = get_container_labels(container)
 
-    host_override_fqdn = labels.get("pfsense.dns.override", None)
-    if not host_override_fqdn:
+    alias_action = get_alias_event_action(event['Action'], labels)
+    if not alias_action:
         return
 
-    alias_fqdn = labels.get("pfsense.dns.alias", None)
-    if not alias_fqdn:
-        return
+    action, alias_config = alias_action
 
-    alias_descr = labels.get('pfsense.dns.description', '')
-
-    if event['Action'] == 'start':
+    if action == "add":
         logger.info(f"Container '{container.name}' is starting...")
-        process_start_event(host_override_fqdn, alias_fqdn, alias_descr)
-    elif event['Action'] == 'stop' and labels.get("pfsense.dns.remove_on_stop", None) == "true":
+        process_start_event(
+            alias_config["host_override_fqdn"],
+            alias_config["alias_fqdn"],
+            alias_config["alias_descr"]
+        )
+    elif action == "remove":
         logger.info(f"Container '{container.name}' is stopping...")
-        process_stop_event(host_override_fqdn, alias_fqdn)
+        process_stop_event(alias_config["host_override_fqdn"], alias_config["alias_fqdn"])
 
 def process_start_event(host_override_fqdn, alias_fqdn, alias_descr):
     """Process a container start event and add an alias if necessary."""
