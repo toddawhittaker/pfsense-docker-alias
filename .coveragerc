@@ -1,0 +1,16 @@
+# Coverage config lives here rather than in pyproject.toml on purpose: this repo
+# has no pyproject.toml or package layout, and pytest's imports depend on that
+# (see AGENTS.md). Adding one to hold coverage settings would risk changing how
+# pytest resolves rootdir and sys.path.
+
+[run]
+source = main, pfsense
+branch = True
+
+[report]
+fail_under = 80
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:

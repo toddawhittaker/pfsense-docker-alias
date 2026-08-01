@@ -420,3 +420,173 @@ def test_del_host_override_alias_returns_false_when_apply_fails(monkeypatch):
     assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
     assert delete_calls == ["delete"]
     assert post_calls == ["post", "post", "post"]
+
+
+def test_split_fqdn_rejects_non_string_input(caplog):
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        assert client.find_host_name(None) is None
+        assert client.find_host_name(12345) is None
+        assert client.find_host_name(["nginx", "lab", "internal"]) is None
+
+    assert "Invalid FQDN" in caplog.text
+
+
+def test_find_alias_in_host_override_rejects_malformed_alias():
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    host_override = {
+        "id": 12,
+        "host": "caddy",
+        "domain": "lab.internal",
+        "aliases": [{"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}],
+    }
+
+    assert client.find_alias_in_host_override(host_override, "nginx") is None
+    assert client.find_alias_in_host_override(host_override, None) is None
+
+
+def test_find_alias_in_host_override_handles_override_without_aliases():
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.find_alias_in_host_override(
+        {"id": 12, "host": "caddy", "domain": "lab.internal"}, "nginx.lab.internal"
+    ) is None
+    assert client.find_alias_in_host_override(
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": None},
+        "nginx.lab.internal",
+    ) is None
+
+
+def test_add_host_override_alias_returns_false_when_host_override_missing(caplog):
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: []
+
+    with caplog.at_level(logging.WARNING):
+        assert not client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+    assert "Host override caddy.lab.internal not found" in caplog.text
+
+
+def test_add_host_override_alias_refuses_to_shadow_an_existing_name(caplog):
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+            ],
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert not client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+    assert "already mapped" in caplog.text
+
+
+def test_del_host_override_alias_returns_false_when_alias_missing(caplog):
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+    assert "not found in host override" in caplog.text
+
+
+def test_del_host_override_alias_returns_false_when_host_override_missing(caplog):
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: []
+
+    with caplog.at_level(logging.WARNING):
+        assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+    assert "Host override caddy.lab.internal not found" in caplog.text
+
+
+def test_del_host_override_alias_returns_false_when_delete_fails(monkeypatch):
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "pfsense.requests.delete",
+        lambda **_kwargs: FakeResponse(error=http_error()),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+            ],
+        }
+    ]
+
+    assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+
+def test_insecure_warning_suppressed_only_when_verification_disabled(monkeypatch):
+    disabled = []
+    monkeypatch.setattr(
+        "pfsense.urllib3.disable_warnings", lambda category: disabled.append(category)
+    )
+
+    PFSense("pfsense.lab.internal", "secret-token")
+    assert disabled == []
+
+    PFSense("pfsense.lab.internal", "secret-token", ca_bundle="/etc/ssl/ca.pem")
+    assert disabled == []
+
+    PFSense("pfsense.lab.internal", "secret-token", verify_ssl=False)
+    assert len(disabled) == 1
+
+
+def test_add_host_override_alias_returns_false_when_alias_post_exhausts_retries(monkeypatch):
+    calls = []
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def always_failing(**_kwargs):
+        calls.append("post")
+        raise requests.ConnectionError("network down")
+
+    monkeypatch.setattr("pfsense.requests.post", always_failing)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    assert not client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+    assert calls == ["post", "post", "post"]
+
+
+def test_del_host_override_alias_returns_false_when_delete_exhausts_retries(monkeypatch):
+    calls = []
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def always_failing(**_kwargs):
+        calls.append("delete")
+        raise requests.ConnectionError("network down")
+
+    monkeypatch.setattr("pfsense.requests.delete", always_failing)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+            ],
+        }
+    ]
+
+    assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+    assert calls == ["delete", "delete", "delete"]
