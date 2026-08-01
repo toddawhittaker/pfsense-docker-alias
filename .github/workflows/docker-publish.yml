@@ -113,7 +113,7 @@ jobs:
       # Extract the version from the Git tag
       - name: Extract tag version
         id: extract_tag
-        run: echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+        run: echo "TAG=${GITHUB_REF##*/}" >> "$GITHUB_ENV"
 
       # Build and push the Docker image
       - name: Build and push Docker image
