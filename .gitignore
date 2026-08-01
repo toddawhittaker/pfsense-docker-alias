@@ -1,5 +1,6 @@
 .venv/
 .vscode/
+.claude/settings.local.json
 __pycache__/
 .codex/
 .codex

@@ -106,6 +106,27 @@ Never log API tokens, secrets, full authorization headers, sensitive environment
 
 Never commit directly to `main`, and never force-push a branch that is under review. If work is already sitting uncommitted on `main`, move it to a branch (`git switch -c type/short-description`) rather than committing it in place.
 
+## Agents and the test-ownership contract
+
+`.claude/agents/` defines six subagents. They exist to keep the invariants above from eroding, so they are committed and reviewed like code — when an invariant changes, the agent that enforces it changes in the same PR.
+
+| Agent | Model | Role |
+|---|---|---|
+| `planner` | Opus | Designs the change, states the test contract, adjudicates test disputes |
+| `tester` | Opus | Writes failing tests first; owns `tests/` |
+| `implementer` | Sonnet | Writes production code to satisfy those tests |
+| `reviewer` | Opus | Correctness review; audits the contract below |
+| `security-reviewer` | Opus | Token, TLS, injection barrier, Docker socket |
+| `dependency-triage` | Sonnet | Validates Dependabot PRs locally |
+
+The intended order for a behavior change is **planner → tester → implementer → reviewer**, with `security-reviewer` added whenever the change touches `pfsense.py`, TLS, logging, dependencies, or the Docker/CI surface.
+
+**The contract:** the tester owns everything under `tests/`. The implementer may not create, edit, or delete those files — not to fix a failure, not to soften an assertion, not to add a skip. When the implementer believes a test encodes the wrong requirement it escalates to the planner, which rules one of three ways: the test is right and the implementation must change (the default), the test is wrong and the *tester* revises it, or the plan was ambiguous and the plan changes first. Difficulty satisfying a test is not evidence that the test is wrong.
+
+This matters here because the assertions are deliberately precise — `tests/test_pfsense.py` pins exact `requests` call sequences and kwargs, which is what makes a dropped `/apply` call or a weakened TLS `verify` fail loudly instead of silently. An implementer that can edit the test can erase the safety net rather than satisfy it.
+
+The reviewer enforces this by checking `git diff main...HEAD -- tests/` and confirming any change there traces to a planner ruling. A human working directly is bound by the same rule: change tests deliberately, as a decision, not as a way to get to green.
+
 ## Working rules
 
 - Make small, reviewable changes.
