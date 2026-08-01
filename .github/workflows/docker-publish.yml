@@ -46,8 +46,10 @@ jobs:
           python -m pip_audit -r requirements.txt --strict
           python -m pip_audit -r requirements-dev.txt --strict
 
-      - name: Run tests
-        run: python -m pytest
+      # Coverage threshold lives in .coveragerc (fail_under). Tests passing is
+      # not sufficient — the step fails if coverage drops below it.
+      - name: Run tests with coverage gate
+        run: python -m pytest --cov --cov-report=term-missing
 
       - name: Build Docker image
         run: docker build -t pfsense-docker-alias .

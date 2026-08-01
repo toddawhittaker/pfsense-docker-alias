@@ -18,7 +18,8 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (31 tests)
+.venv/bin/python -m pytest                          # full suite (57 tests)
+.venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
 .venv/bin/python -m pip_audit -r requirements.txt --strict       # no known CVEs allowed
@@ -30,6 +31,10 @@ docker build -t pfsense-docker-alias .              # required after changing Do
 Run pytest as `python -m pytest` from the repo root. There is no `conftest.py`, `pyproject.toml`, or package layout — `main` and `pfsense` are importable only because `python -m` puts the CWD on `sys.path`. Bare `pytest` fails collection with `ModuleNotFoundError: No module named 'pfsense'`.
 
 `pylint` must stay at 10.00/10 — CI fails on any message. Suppressions are local `# pylint: disable=` pragmas at the narrowest scope that works, never a config file: `logging-fstring-interpolation` module-wide in both modules (the codebase logs with f-strings by convention), and `too-many-return-statements` on `add_host_override_alias`, whose seven returns are deliberate guard clauses.
+
+Test coverage is gated at **80%** with branch coverage on, configured in `.coveragerc` (`fail_under`) and enforced by CI's `--cov` run — the step fails when coverage drops below the line even if every test passes. Coverage currently sits at ~99%, so the gate is a floor against regression, not a target to chase: the headroom is there to be spent on real behavior, never on tests written only to move the number. If a change genuinely cannot be covered, exclude it deliberately with a `# pragma: no cover` and say why, rather than lowering `fail_under`.
+
+Coverage config lives in `.coveragerc` rather than `pyproject.toml` on purpose — this repo has no `pyproject.toml` or package layout, and pytest's imports depend on that, so introducing one to hold settings risks changing how rootdir and `sys.path` resolve.
 
 `actionlint` checks the workflow files and is not a pip package — download it when you need it. It shells out to `shellcheck` for `run:` blocks **only if shellcheck is on `PATH`**, and GitHub runners have it while a plain dev box usually does not. Local actionlint without shellcheck is therefore weaker than CI and will miss shell issues that fail the build; install shellcheck before trusting a local pass.
 
@@ -52,7 +57,7 @@ docker rm -f pfsense-alias-smoke smoke-nginx
 
 Expect start/stop to be detected, three retries per API call, an error log, and the service to **stay running** — that resilience is the contract, so a crash here is a regression.
 
-CI (`.github/workflows/docker-publish.yml`) runs on every PR and push to `main`: actionlint → compile → pylint → pip-audit → pytest → `docker build` → two container smoke tests. The smoke tests run the built image and assert it exits 1 with a config error when unconfigured, then boots and reaches its event loop when configured. They exist because `docker build` cannot catch a runtime module missing its `COPY` — that image builds cleanly and dies at import. The ghcr.io publish job runs only on tag pushes.
+CI (`.github/workflows/docker-publish.yml`) runs on every PR and push to `main`: actionlint → compile → pylint → pip-audit → pytest with the coverage gate → `docker build` → two container smoke tests. The smoke tests run the built image and assert it exits 1 with a config error when unconfigured, then boots and reaches its event loop when configured. They exist because `docker build` cannot catch a runtime module missing its `COPY` — that image builds cleanly and dies at import. The ghcr.io publish job runs only on tag pushes.
 
 ## Architecture
 

@@ -29,7 +29,7 @@ class FakeDockerClient:
         self.closed = True
 
 
-def load_main(monkeypatch, verify_ssl=None, ca_bundle=None):
+def load_main(monkeypatch, verify_ssl=None, ca_bundle=None, add_on_startup=None):
     fake_client = FakeDockerClient()
     fake_docker = types.SimpleNamespace(
         from_env=lambda: fake_client,
@@ -38,6 +38,10 @@ def load_main(monkeypatch, verify_ssl=None, ca_bundle=None):
 
     monkeypatch.setenv("PFSENSE_HOSTNAME", "pfsense.lab.internal")
     monkeypatch.setenv("PFSENSE_API_TOKEN", "test-token")
+    if add_on_startup is None:
+        monkeypatch.delenv("ADD_ALIASES_ON_STARTUP", raising=False)
+    else:
+        monkeypatch.setenv("ADD_ALIASES_ON_STARTUP", add_on_startup)
     if verify_ssl is None:
         monkeypatch.delenv("PFSENSE_VERIFY_SSL", raising=False)
     else:
@@ -308,3 +312,249 @@ def test_run_exits_nonzero_on_unexpected_exception(monkeypatch):
         assert exc.code == 1
     else:
         raise AssertionError("run() did not exit")
+
+
+# --- Startup and shutdown contracts -----------------------------------------
+
+
+def test_get_env_var_exits_when_required_value_missing(monkeypatch, caplog):
+    main, _fake_client = load_main(monkeypatch)
+    monkeypatch.delenv("DEFINITELY_NOT_SET", raising=False)
+
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            main.get_env_var("DEFINITELY_NOT_SET")
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("get_env_var did not exit")
+
+    assert "DEFINITELY_NOT_SET" in caplog.text
+
+
+def test_import_exits_when_required_env_var_missing(monkeypatch):
+    fake_client = FakeDockerClient()
+    fake_docker = types.SimpleNamespace(
+        from_env=lambda: fake_client,
+        errors=types.SimpleNamespace(DockerException=DockerException, NotFound=DockerNotFound),
+    )
+    monkeypatch.delenv("PFSENSE_HOSTNAME", raising=False)
+    monkeypatch.setenv("PFSENSE_API_TOKEN", "test-token")
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+    sys.modules.pop("main", None)
+
+    try:
+        importlib.import_module("main")
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("import did not exit")
+    finally:
+        sys.modules.pop("main", None)
+
+
+def test_import_exits_when_docker_client_cannot_initialize(monkeypatch):
+    def unavailable():
+        raise DockerException("cannot connect to docker daemon")
+
+    fake_docker = types.SimpleNamespace(
+        from_env=unavailable,
+        errors=types.SimpleNamespace(DockerException=DockerException, NotFound=DockerNotFound),
+    )
+    monkeypatch.setenv("PFSENSE_HOSTNAME", "pfsense.lab.internal")
+    monkeypatch.setenv("PFSENSE_API_TOKEN", "test-token")
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+    sys.modules.pop("main", None)
+
+    try:
+        importlib.import_module("main")
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("import did not exit")
+    finally:
+        sys.modules.pop("main", None)
+
+
+def test_cleanup_closes_client_and_exits_zero(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+
+    try:
+        main.cleanup(15, None)
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("cleanup did not exit")
+
+    assert fake_client.closed is True
+
+
+def test_cleanup_still_exits_zero_when_close_fails(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+
+    def failing_close():
+        raise DockerException("close failed")
+
+    fake_client.close = failing_close
+
+    with caplog.at_level(logging.ERROR):
+        try:
+            main.cleanup(15, None)
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            raise AssertionError("cleanup did not exit")
+
+    assert "cleanup" in caplog.text
+
+
+def test_cleanup_survives_unexpected_close_error(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+
+    def failing_close():
+        raise RuntimeError("something unexpected")
+
+    fake_client.close = failing_close
+
+    with caplog.at_level(logging.ERROR):
+        try:
+            main.cleanup(15, None)
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            raise AssertionError("cleanup did not exit")
+
+    assert "cleanup" in caplog.text
+
+
+# --- Resilience: one bad container must not kill the service -----------------
+
+
+def test_get_container_labels_handles_malformed_attrs(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+
+    assert main.get_container_labels(types.SimpleNamespace(attrs={})) == {}
+    assert main.get_container_labels(types.SimpleNamespace(attrs={"Config": None})) == {}
+    assert main.get_container_labels(types.SimpleNamespace(attrs=None)) == {}
+
+
+def test_handle_container_event_survives_missing_container(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+
+    def gone(_container_id):
+        raise DockerNotFound("no such container")
+
+    fake_client.containers.get = gone
+
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    assert "Container not found" in caplog.text
+
+
+def test_handle_container_event_survives_docker_error(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+
+    def unavailable(_container_id):
+        raise DockerException("daemon unavailable")
+
+    fake_client.containers.get = unavailable
+
+    with caplog.at_level(logging.ERROR):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    assert "handle_container_event" in caplog.text
+
+
+def test_handle_container_event_ignores_unlabeled_container(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    calls = []
+    fake_client.container = types.SimpleNamespace(
+        name="plain", attrs={"Config": {"Labels": {}}}
+    )
+    monkeypatch.setattr(main, "process_start_event", lambda *a: calls.append(a))
+
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    assert calls == []
+
+
+def test_get_alias_event_action_ignores_unrelated_actions(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    labels = {
+        "pfsense.dns.override": "caddy.lab.internal",
+        "pfsense.dns.alias": "nginx.lab.internal",
+        "pfsense.dns.remove_on_stop": "true",
+    }
+
+    assert main.get_alias_event_action("restart", labels) is None
+    assert main.get_alias_event_action("start", {}) is None
+
+
+def test_add_aliases_on_startup_survives_docker_error(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+    calls = []
+
+    def unavailable():
+        raise DockerException("daemon unavailable")
+
+    fake_client.containers.list = unavailable
+    main.NAMESERVER = types.SimpleNamespace(
+        add_host_override_alias=lambda *args: calls.append(args)
+    )
+
+    with caplog.at_level(logging.ERROR):
+        main.add_aliases_on_startup()
+
+    assert calls == []
+    assert "add_aliases_on_startup" in caplog.text
+
+
+def test_add_aliases_on_startup_reports_when_nothing_labeled(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+    fake_client.containers.list = lambda: [
+        types.SimpleNamespace(name="plain", attrs={"Config": {"Labels": {}}})
+    ]
+    main.NAMESERVER = types.SimpleNamespace(add_host_override_alias=lambda *args: None)
+
+    with caplog.at_level(logging.INFO):
+        main.add_aliases_on_startup()
+
+    assert "No aliases found during startup" in caplog.text
+
+
+# --- Dispatch and wiring -----------------------------------------------------
+
+
+def test_process_events_delegate_to_nameserver(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    added = []
+    removed = []
+    main.NAMESERVER = types.SimpleNamespace(
+        add_host_override_alias=lambda host, alias, descr: added.append((host, alias, descr)),
+        del_host_override_alias=lambda host, alias: removed.append((host, alias)),
+    )
+
+    main.process_start_event("caddy.lab.internal", "nginx.lab.internal", "nginx service")
+    main.process_stop_event("caddy.lab.internal", "nginx.lab.internal")
+
+    assert added == [("caddy.lab.internal", "nginx.lab.internal", "nginx service")]
+    assert removed == [("caddy.lab.internal", "nginx.lab.internal")]
+
+
+def test_main_runs_startup_scan_only_when_enabled(monkeypatch):
+    main, _fake_client = load_main(monkeypatch, add_on_startup="true")
+    scanned = []
+    monkeypatch.setattr(main, "add_aliases_on_startup", lambda: scanned.append(True))
+
+    main.main()
+
+    assert scanned == [True]
+
+    main, _fake_client = load_main(monkeypatch)
+    scanned = []
+    monkeypatch.setattr(main, "add_aliases_on_startup", lambda: scanned.append(True))
+
+    main.main()
+
+    assert scanned == []
