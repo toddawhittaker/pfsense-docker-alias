@@ -1,5 +1,5 @@
 # Start with a minimal Alpine-based Python image
-FROM python:3.12-alpine
+FROM python:3.14-alpine
 
 # Set environment variables for Python to avoid buffering and write logs immediately
 ENV PYTHONUNBUFFERED=1
