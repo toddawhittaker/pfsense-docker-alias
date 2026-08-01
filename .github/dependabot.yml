@@ -1,0 +1,36 @@
+version: 2
+
+updates:
+  # Runtime and dev pins. These are the packages that carry the TLS calls and
+  # API token to pfSense, so stale pins are a security problem, not just drift.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    labels:
+      - dependencies
+
+  # Workflow action versions.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    labels:
+      - dependencies
+
+  # Base image (python:3.12-alpine) rebuilds.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    labels:
+      - dependencies

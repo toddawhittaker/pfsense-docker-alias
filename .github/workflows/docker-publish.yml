@@ -29,14 +29,61 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-dev.txt
 
+      - name: Lint workflows
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            | bash -s -- latest "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/actionlint" -color
+
       - name: Compile Python files
         run: python -m py_compile main.py pfsense.py
+
+      - name: Lint
+        run: python -m pylint main.py pfsense.py
+
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          python -m pip_audit -r requirements.txt --strict
+          python -m pip_audit -r requirements-dev.txt --strict
 
       - name: Run tests
         run: python -m pytest
 
       - name: Build Docker image
         run: docker build -t pfsense-docker-alias .
+
+      # Guards what `docker build` cannot: that the image's Python entrypoint
+      # actually runs. A new runtime module missing its Dockerfile COPY builds
+      # fine and fails only at import time.
+      - name: Smoke test image rejects missing configuration
+        run: |
+          set +e
+          output=$(docker run --rm pfsense-docker-alias 2>&1)
+          status=$?
+          set -e
+          echo "${output}"
+          if [ "${status}" -ne 1 ]; then
+            echo "::error::expected exit 1 without env vars, got ${status}"
+            exit 1
+          fi
+          echo "${output}" | grep -q "PFSENSE_HOSTNAME" \
+            || { echo "::error::missing expected config error"; exit 1; }
+
+      - name: Smoke test image starts and listens for events
+        run: |
+          docker run -d --name smoke \
+            -e PFSENSE_HOSTNAME=pfsense.invalid -e PFSENSE_API_TOKEN=dummy \
+            -v /var/run/docker.sock:/var/run/docker.sock pfsense-docker-alias
+          for _ in $(seq 1 30); do
+            docker logs smoke 2>&1 | grep -q "Listening for container start/stop events" && break
+            sleep 1
+          done
+          docker logs smoke
+          docker logs smoke 2>&1 | grep -q "Listening for container start/stop events" \
+            || { echo "::error::container never reached its event loop"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Status}}' smoke)" = "running" ] \
+            || { echo "::error::container did not stay running"; exit 1; }
+          docker rm -f smoke
 
   build-and-push:
     if: startsWith(github.ref, 'refs/tags/')

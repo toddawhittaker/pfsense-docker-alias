@@ -20,14 +20,18 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
 .venv/bin/python -m pytest                          # full suite (31 tests)
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
-.venv/bin/python -m pylint main.py pfsense.py       # not run by CI, but must stay at 10.00/10
+.venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
+.venv/bin/python -m pip_audit -r requirements.txt --strict       # no known CVEs allowed
+.venv/bin/python -m pip_audit -r requirements-dev.txt --strict
 
 docker build -t pfsense-docker-alias .              # required after changing Docker-related files
 ```
 
 Run pytest as `python -m pytest` from the repo root. There is no `conftest.py`, `pyproject.toml`, or package layout — `main` and `pfsense` are importable only because `python -m` puts the CWD on `sys.path`. Bare `pytest` fails collection with `ModuleNotFoundError: No module named 'pfsense'`.
 
-`pylint` is pinned in `requirements-dev.txt` but is **not** run by CI, so it will not catch regressions for you — run it by hand. The tree is currently clean at 10.00/10; keep it there. Suppressions are local `# pylint: disable=` pragmas at the narrowest scope that works, never a config file: `logging-fstring-interpolation` module-wide in both modules (the codebase logs with f-strings by convention), and `too-many-return-statements` on `add_host_override_alias`, whose seven returns are deliberate guard clauses.
+`pylint` must stay at 10.00/10 — CI fails on any message. Suppressions are local `# pylint: disable=` pragmas at the narrowest scope that works, never a config file: `logging-fstring-interpolation` module-wide in both modules (the codebase logs with f-strings by convention), and `too-many-return-statements` on `add_host_override_alias`, whose seven returns are deliberate guard clauses.
+
+`pip-audit` runs `--strict` against both requirements files, so a newly disclosed CVE in a pinned dependency turns CI red without any code change. That is intended: this service ships TLS calls and an API token, and `certifi` *is* its trust store. Fix by bumping the pin, not by ignoring the finding. Dependabot (`.github/dependabot.yml`) opens weekly PRs for pip, GitHub Actions, and the base image to keep that from accumulating.
 
 ### Manual end-to-end check
 
@@ -46,7 +50,7 @@ docker rm -f pfsense-alias-smoke smoke-nginx
 
 Expect start/stop to be detected, three retries per API call, an error log, and the service to **stay running** — that resilience is the contract, so a crash here is a regression.
 
-CI (`.github/workflows/docker-publish.yml`) runs compile → pytest → `docker build` on every PR and push to `main`. The ghcr.io publish job runs only on tag pushes.
+CI (`.github/workflows/docker-publish.yml`) runs on every PR and push to `main`: actionlint → compile → pylint → pip-audit → pytest → `docker build` → two container smoke tests. The smoke tests run the built image and assert it exits 1 with a config error when unconfigured, then boots and reaches its event loop when configured. They exist because `docker build` cannot catch a runtime module missing its `COPY` — that image builds cleanly and dies at import. The ghcr.io publish job runs only on tag pushes.
 
 ## Architecture
 
@@ -94,7 +98,7 @@ Never log API tokens, secrets, full authorization headers, sensitive environment
 
 1. Branch from an up-to-date `main`: `git switch main && git pull && git switch -c type/short-description`. Use `feat/`, `fix/`, `chore/`, `docs/`, or `refactor/` as the prefix.
 2. Commit as you go — messy branch commits are fine, squash collapses them.
-3. Before pushing, run the compile, test, lint, and build commands from **Commands** above. CI runs compile → pytest → `docker build`, but **not** pylint, so a lint regression will pass CI and still be wrong.
+3. Before pushing, run the compile, lint, audit, test, and build commands from **Commands** above. CI runs the same checks, so running them locally just saves a round trip.
 4. Push and open a PR: `git push -u origin HEAD && gh pr create`. Say what changed and why, and note anything you deliberately did not do.
 5. Wait for review. Do not merge on the author's behalf unless explicitly asked — the PR exists so a human sees the change before it lands.
 
