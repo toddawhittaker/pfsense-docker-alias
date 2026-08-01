@@ -24,7 +24,7 @@ updates:
     labels:
       - dependencies
 
-  # Base image (python:3.12-alpine) rebuilds.
+  # Base image (python:3.14-alpine) rebuilds.
   - package-ecosystem: docker
     directory: /
     schedule:

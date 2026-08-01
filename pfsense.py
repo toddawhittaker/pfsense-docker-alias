@@ -15,7 +15,7 @@ The class ensures robust error handling, logs failures without crashing the appl
 and supports secure API interactions using the pfSense API key.
 
 Dependencies:
-- Python 3.12 in the provided Docker image
+- Python 3.14 in the provided Docker image
 - Requests library for HTTP requests
 - urllib3 for TLS warning management when verification is explicitly disabled
 

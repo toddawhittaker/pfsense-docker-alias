@@ -9,10 +9,10 @@ This repository contains a lightweight Python Docker service that listens to Doc
 
 ## Commands
 
-A `.venv` (CPython 3.12, matching CI and the runtime image) is already set up at the repo root and is gitignored. Recreate it with:
+A `.venv` (CPython 3.14, matching CI and the runtime image) is already set up at the repo root and is gitignored. Recreate it with:
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.14
 uv pip install -r requirements.txt -r requirements-dev.txt
 ```
 
