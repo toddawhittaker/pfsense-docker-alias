@@ -80,9 +80,17 @@ Deliberately asymmetric — keep it that way:
 - `_request` retries `requests.RequestException` up to `API_REQUEST_ATTEMPTS` (3) with a 1s sleep. `raise_for_status()` is called *outside* the retry, so HTTP error statuses are not retried. Tests monkeypatch `pfsense.time.sleep`.
 - Docker event-stream errors **re-raise** out of `main()`; `run()` catches and exits non-zero so the container restarts.
 
-### Mutations are always two calls
+### Mutations are staged, then applied
 
-`add_host_override_alias` and `del_host_override_alias` each perform the mutation, then POST to `/dns_resolver/apply`. Both must succeed to return `True`. Any new mutating method needs the same apply step.
+`add_host_override_alias` and `del_host_override_alias` perform the mutation, then apply it via `apply_changes()` unless called with `apply=False`. Any new mutating method needs the same option.
+
+Applying is the expensive part: it reloads unbound, takes seconds, and **runs asynchronously** — the POST returns before the reload finishes. `apply_changes()` therefore polls `GET /dns_resolver/apply` until the response reports `applied`, up to `APPLY_POLL_ATTEMPTS`, and returns `False` with an error if it never confirms. Treat an unconfirmed reload as a possible lost update, not a success.
+
+That status poll passes `attempts=1` to `_request`. Do not let it use the default retry budget — a retry budget nested inside a poll budget multiplies into a stall long enough to block the event loop.
+
+**Never apply once per item in a loop.** `add_aliases_on_startup` stages every alias with `apply=False` and calls `apply_changes()` exactly once at the end, skipping it entirely when nothing staged. Applying per alias meant 20 containers cost 20 unbound reloads and ~40s of DNS disruption, with overlapping async reloads a likely cause of dropped updates. `tests/test_main.py::test_startup_scan_applies_once_for_many_aliases` pins this by counting.
+
+With `apply=False`, a `True` return means **staged in the pfSense configuration but not yet live**. Staged changes persist and go live on the next successful apply.
 
 `add_host_override_alias` first calls `find_host_name(alias_fqdn)` to reject an alias already used as a host override or alias anywhere, then resolves the parent host override — the override must already exist in pfSense; this service never creates one.
 
@@ -91,7 +99,7 @@ Deliberately asymmetric — keep it that way:
 - `PFSENSE_VERIFY_SSL` is true unless it lowercases to exactly `"false"` (fail-secure). `ADD_ALIASES_ON_STARTUP` is false unless it lowercases to `"true"`.
 - The `pfsense.dns.remove_on_stop` label must be the exact lowercase string `"true"` — case-sensitive, unlike the env vars. There is a test pinning this.
 - `PFSENSE_CA_BUNDLE` wins over `PFSENSE_VERIFY_SSL`: `verify_ssl = ca_bundle if ca_bundle else verify_ssl`, and the result is passed straight to `requests`' `verify=`.
-- Startup sync is additive only — it never prunes stale aliases.
+- Startup sync is additive only — it never prunes stale aliases. It stages every alias and applies once at the end; see "Mutations are staged, then applied".
 
 ### Validation and logging constraints
 
