@@ -9,6 +9,7 @@ docker-compose.yaml
 test.sh
 .github/
 AGENTS.md
+CLAUDE.md
 .codex/
 .codex
 requirements-dev.txt

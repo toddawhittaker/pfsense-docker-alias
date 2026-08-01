@@ -1,8 +1,8 @@
 """
 pfsense.py
 
-This module provides an abstraction layer for interacting with a pfSense instance via the 
-UNOFFICIAL pfSense REST API. It simplifies the management of DNS host overrides and aliases, 
+This module provides an abstraction layer for interacting with a pfSense instance via the
+UNOFFICIAL pfSense REST API. It simplifies the management of DNS host overrides and aliases,
 allowing for seamless integration with automated workflows, such as Docker-based environments.
 
 Features:
@@ -11,7 +11,7 @@ Features:
 - Remove DNS aliases from host overrides.
 - Apply DNS changes in pfSense.
 
-The class ensures robust error handling, logs failures without crashing the application, 
+The class ensures robust error handling, logs failures without crashing the application,
 and supports secure API interactions using the pfSense API key.
 
 Dependencies:
@@ -183,10 +183,17 @@ class PFSense:
 
         alias = None
         if 'aliases' in host_override and host_override['aliases']:
-            alias = next((al for al in host_override['aliases'] if al['host'] == alias_host and al['domain'] == alias_domain), None)
+            alias = next(
+                (
+                    al for al in host_override['aliases']
+                    if al['host'] == alias_host and al['domain'] == alias_domain
+                ),
+                None
+            )
         return alias
 
     def add_host_override_alias(self, host_override_fqdn, alias_fqdn, alias_descr=""):
+        # pylint: disable=too-many-return-statements
         """
         Adds an alias to an existing host override in pfSense.
 
@@ -203,7 +210,9 @@ class PFSense:
 
         alias = self.find_host_name(alias_fqdn)
         if alias is not None:
-            logger.warning(f"Alias {alias_fqdn} already mapped to {alias['host']}.{alias['domain']}.")
+            logger.warning(
+                f"Alias {alias_fqdn} already mapped to {alias['host']}.{alias['domain']}."
+            )
             return False
 
         host_override = self.find_host_name(host_override_fqdn)
@@ -258,16 +267,23 @@ class PFSense:
             return False
 
     def del_host_override_alias(self, host_override_fqdn, alias_fqdn):
+        """
+        Removes an alias from an existing host override in pfSense.
+
+        :param host_override_fqdn: The fully qualified domain name of the existing host override.
+        :param alias_fqdn: The fully qualified domain name of the alias to remove.
+        :return: True if the alias was removed, False otherwise
+        """
         host_override = self.find_host_name(host_override_fqdn)
         if not host_override:
             logger.warning(f"Host override {host_override_fqdn} not found.")
             return False
-        
+
         alias = self.find_alias_in_host_override(host_override, alias_fqdn)
         if not alias:
             logger.warning(f"Alias {alias_fqdn} not found in host override {host_override_fqdn}.")
             return False
-        
+
         headers = {
             'X-API-Key': f"{self.pfsense_api_key}",
             'Content-Type': 'application/json'
@@ -311,4 +327,3 @@ class PFSense:
         except requests.RequestException as e:
             self._handle_api_error(e, "del_host_override_alias")
             return False
-        
