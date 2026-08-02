@@ -1314,15 +1314,31 @@ def test_api_error_log_cannot_forge_a_log_record(monkeypatch, caplog):
 # --- Sanitization is bounded, and applies to the log only ----------------------
 
 
-def test_a_long_but_valid_fqdn_is_truncated_in_the_log_but_not_in_the_payload(monkeypatch, caplog):
-    """
-    Sanitization is a *rendering* step. It must never reach the value passed onward.
+# Lengths that straddle the 253-character presentation-format bound. Three 63-character
+# labels plus their three dots come to 192, so the final label decides the total; every
+# label in all four is individually valid, which is the whole point — label validity has
+# never bounded the total.
+FQDN_252 = ".".join(["a" * 63] * 3 + ["a" * 60])
+FQDN_253 = ".".join(["a" * 63] * 3 + ["a" * 61])
+FQDN_254 = ".".join(["a" * 63] * 3 + ["a" * 62])
+# 40 labels of 60 characters: 2439 characters, every label valid.
+FQDN_HUGE = ".".join(["a" * 60] * 40)
+# What _split_fqdn must return as the domain half of each.
+FQDN_253_DOMAIN = ".".join(["a" * 63] * 2 + ["a" * 61])
+FQDN_254_DOMAIN = ".".join(["a" * 63] * 2 + ["a" * 62])
 
-    DNS_LABEL_PATTERN bounds each label at 63 characters but not the label count, so an
-    FQDN can pass validation and still be kilobytes long. That makes this the one place
-    in the suite that can distinguish "escaped and truncated for the log" from "escaped
-    and truncated everywhere" — the second corrupts the pfSense API payload, writing an
-    alias whose name is not the name the operator asked for.
+
+def test_a_maximal_length_fqdn_reaches_the_payload_byte_for_byte(monkeypatch, caplog):
+    """
+    Sanitization is a *rendering* step and the length cap is a *validation* step;
+    neither may alter the value that goes into the API payload.
+
+    An FQDN of exactly MAX_FQDN_CHARS is the longest value that can legitimately reach
+    the payload, so it is where a cap implemented as truncation — or a payload value
+    routed through sanitize_for_log() — would show up: pfSense would get an alias whose
+    name is not the name the operator asked for. At 253 characters the value is also
+    under LOG_VALUE_MAX_CHARS, so the accepted case carries no truncation marker
+    anywhere, in the payload or in the log.
     """
     posts = []
 
@@ -1334,23 +1350,19 @@ def test_a_long_but_valid_fqdn_is_truncated_in_the_log_but_not_in_the_payload(mo
     monkeypatch.setattr("pfsense.requests.post", fake_post)
     monkeypatch.setattr("pfsense.requests.get", applied_status_get())
 
-    # 40 labels of 60 characters: 2439 characters, every label valid.
-    long_fqdn = ".".join(["a" * 60] * 40)
     client = PFSense("pfsense.lab.internal", "secret-token")
     client.get_all_host_overrides = lambda: [
         {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
     ]
 
     with caplog.at_level(logging.INFO):
-        assert client.add_host_override_alias("caddy.lab.internal", long_fqdn) is True
+        assert client.add_host_override_alias("caddy.lab.internal", FQDN_253) is True
 
     added = [m for m in log_messages(caplog) if "added to host override" in m]
     assert len(added) == 1
-    assert pfsense.LOG_TRUNCATION_MARKER in added[0]
-    assert len(added[0]) < pfsense.LOG_VALUE_MAX_CHARS + 200
-    assert long_fqdn not in added[0]
-    # The evidence survives: an operator can still see what was asked for.
-    assert "a" * 60 in added[0]
+    # An accepted value renders verbatim: no escaping, no truncation, no marker.
+    assert FQDN_253 in added[0]
+    assert added[0].count(pfsense.LOG_TRUNCATION_MARKER) == 0
 
     # The load-bearing assertion: the alias-creation payload is byte-for-byte the
     # validated value, with no marker, no escape, and no truncation.
@@ -1360,33 +1372,35 @@ def test_a_long_but_valid_fqdn_is_truncated_in_the_log_but_not_in_the_payload(mo
     )
     assert alias_post["json"] == {
         "parent_id": "12",
-        "host": "a" * 60,
-        "domain": ".".join(["a" * 60] * 39),
+        "host": "a" * 63,
+        "domain": FQDN_253_DOMAIN,
         "descr": "",
     }
+    assert f'{alias_post["json"]["host"]}.{alias_post["json"]["domain"]}' == FQDN_253
     assert pfsense.LOG_TRUNCATION_MARKER not in alias_post["json"]["domain"]
     assert "\\" not in alias_post["json"]["domain"]
 
 
 def test_already_mapped_warning_truncates_oversized_api_values(caplog):
     """
-    All THREE values on this line are unbounded, and all three must be capped.
+    Two of the three values on this line are unbounded, and both must be capped.
 
-    Two are API supplied; the third is the label-supplied alias_fqdn, which reaches this
-    line having passed _split_fqdn — validation bounds each label at 63 characters but
-    not the label count, so a 24,399-character all-valid FQDN is accepted by Docker
-    verbatim and, under --restart=always, writes ~24 KB of uncapped log per start.
+    The host and domain come from the pfSense API response, which can return anything —
+    nothing in this service bounds them, so they need the per-value cap. The third value,
+    the label-supplied alias_fqdn, used to be unbounded too and this test used to pin all
+    three; the 253-character bound in _split_fqdn now rejects an over-long alias before
+    execution ever reaches this line, so the alias here is a validated one. That
+    label-supplied-unbounded property now lives in
+    test_an_oversized_fqdn_is_truncated_in_the_rejection_log.
 
-    Requiring three markers pins each value independently: the cap is per value, not per
-    message, and removing the call from any single half drops the count to 2. Capping
-    the whole message would make each value's rendering depend on its neighbours and
-    break the exact-wording guarantee pinned elsewhere.
+    Requiring two markers pins each API value independently: the cap is per value, not
+    per message, and removing the call from either half drops the count to 1. Capping the
+    whole message would make each value's rendering depend on its neighbours and break
+    the exact-wording guarantee, which holds here too — the bounded alias renders
+    unchanged on the same line as two truncations.
     """
-    # 40 valid labels of 60 characters; the alias branch of find_host_name resolves the
-    # parent, so the override's own oversized name lands on the line beside it.
-    long_alias = ".".join(["a" * 60] * 40)
-    alias_host = "a" * 60
-    alias_domain = ".".join(["a" * 60] * 39)
+    # The alias branch of find_host_name resolves the parent, so the override's own
+    # oversized name lands on the line beside the alias that matched.
     client = PFSense("pfsense.lab.internal", "secret-token")
     client.get_all_host_overrides = lambda: [
         {
@@ -1394,23 +1408,470 @@ def test_already_mapped_warning_truncates_oversized_api_values(caplog):
             "host": "c" * 5000,
             "domain": "d" * 5000,
             "aliases": [
-                {"id": 34, "parent_id": 12, "host": alias_host, "domain": alias_domain}
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
             ],
         }
     ]
 
     with caplog.at_level(logging.WARNING):
-        assert client.add_host_override_alias("caddy.lab.internal", long_alias) is False
+        assert client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
 
     assert_no_forged_log_records(caplog)
     mapped = [m for m in log_messages(caplog) if "already mapped" in m]
     assert len(mapped) == 1
-    assert mapped[0].count(pfsense.LOG_TRUNCATION_MARKER) == 3
-    assert len(mapped[0]) < 3 * pfsense.LOG_VALUE_MAX_CHARS + 200
-    assert long_alias not in mapped[0]
+    assert mapped[0].count(pfsense.LOG_TRUNCATION_MARKER) == 2
+    assert len(mapped[0]) < 2 * pfsense.LOG_VALUE_MAX_CHARS + 200
+    assert "nginx.lab.internal" in mapped[0]
     assert "c" * 5000 not in mapped[0]
     assert "d" * 5000 not in mapped[0]
-    # The evidence survives for all three.
-    assert "a" * 60 in mapped[0]
+    # The evidence survives for both truncated values.
     assert "c" * 100 in mapped[0]
     assert "d" * 100 in mapped[0]
+
+
+# --- The payload barrier is bounded --------------------------------------------
+
+
+def warning_messages(caplog):
+    """The formatted message of each captured record at WARNING or above."""
+    return [
+        record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+
+
+def test_split_fqdn_accepts_an_fqdn_at_the_length_limit(caplog):
+    """
+    Exactly MAX_FQDN_CHARS is legal, so the comparison is `>`, not `>=`.
+
+    RFC 1035 bounds the presentation form at 253 characters, and this value is the
+    longest legal one. An off-by-one here rejects a name pfSense would happily hold.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        result = client._split_fqdn(FQDN_253, "add_host_override_alias")
+
+    assert pfsense.MAX_FQDN_CHARS == 253
+    assert len(FQDN_253) == pfsense.MAX_FQDN_CHARS
+    assert len(FQDN_253_DOMAIN) == 189
+    assert result == ("a" * 63, FQDN_253_DOMAIN)
+    assert warning_messages(caplog) == []
+
+
+def test_split_fqdn_accepts_an_fqdn_one_character_under_the_limit(caplog):
+    """The ordinary side of the boundary: under the cap is unaffected by the cap."""
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        result = client._split_fqdn(FQDN_252, "add_host_override_alias")
+
+    assert len(FQDN_252) == pfsense.MAX_FQDN_CHARS - 1
+    assert result == ("a" * 63, ".".join(["a" * 63] * 2 + ["a" * 60]))
+    assert warning_messages(caplog) == []
+
+
+def test_split_fqdn_rejects_an_fqdn_one_character_over_the_limit(caplog):
+    """
+    One character over is rejected, and says so distinguishably.
+
+    Every label here is valid, which is the finding: DNS_LABEL_PATTERN caps a label at
+    63 characters and nothing caps the count, so all-valid labels can add up to any
+    length at all. The rejection wording has to be tellable apart from the two existing
+    "Invalid FQDN" branches — a test that cannot say which branch fired cannot prove the
+    length check exists rather than some other rule catching the value by accident.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        result = client._split_fqdn(FQDN_254, "add_host_override_alias")
+
+    assert len(FQDN_254) == pfsense.MAX_FQDN_CHARS + 1
+    assert result is None
+    warnings = warning_messages(caplog)
+    assert len(warnings) == 1
+    assert "exceeds 253 characters" in warnings[0]
+    assert "add_host_override_alias" in warnings[0]
+
+
+def test_an_oversized_alias_is_rejected_before_any_request_is_made(monkeypatch):
+    """
+    Rejection means no request at all, not a shortened one.
+
+    This is the test that fails if the bound is implemented as truncation: truncating a
+    2439-character FQDN to 253 would create a real alias under a name nobody asked for,
+    which is worse than the unbounded payload it was meant to fix. Nothing may be sent,
+    and nothing may be left staged for a later apply to push live.
+    """
+    posts = []
+    gets = []
+    deletes = []
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "pfsense.requests.post",
+        lambda url, **_kwargs: posts.append(url) or FakeResponse(),
+    )
+    monkeypatch.setattr(
+        "pfsense.requests.get",
+        lambda url, **_kwargs: gets.append(url) or FakeResponse(),
+    )
+    monkeypatch.setattr(
+        "pfsense.requests.delete",
+        lambda url, **_kwargs: deletes.append(url) or FakeResponse(),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.add_host_override_alias("caddy.lab.internal", FQDN_HUGE) is False
+    assert posts == []
+    assert gets == []
+    assert deletes == []
+    assert client.unapplied_changes is False
+
+
+def test_an_oversized_fqdn_is_truncated_in_the_rejection_log(monkeypatch, caplog):
+    """
+    The rejection branch logs the value it just rejected, so the log cap must hold here.
+
+    An over-long FQDN is exactly the value a hostile or careless label can make
+    arbitrarily large, and under --restart=always the rejection repeats on every start.
+    Bounding the payload does not bound the log: the two caps are separate, and this is
+    the case that needs both.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", lambda **_kwargs: FakeResponse())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias("caddy.lab.internal", FQDN_HUGE) is False
+
+    assert_no_forged_log_records(caplog)
+    warnings = warning_messages(caplog)
+    assert len(warnings) == 1
+    assert pfsense.LOG_TRUNCATION_MARKER in warnings[0]
+    assert len(warnings[0]) < pfsense.LOG_VALUE_MAX_CHARS + 200
+    assert FQDN_HUGE not in warnings[0]
+    # The evidence survives: an operator can still see what was asked for.
+    assert "a" * 60 in warnings[0]
+
+
+def test_an_oversized_host_override_fqdn_is_rejected(monkeypatch):
+    """
+    The parent FQDN crosses the same boundary as the alias and gets the same rule.
+
+    The parent is never written into a payload as a name — it is resolved to an id — but
+    it is matched against every host override, and an unbounded value has no business
+    getting that far. The override below deliberately exists under the oversized name,
+    so only the length check can stop this.
+    """
+    posts = []
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "pfsense.requests.post",
+        lambda url, **_kwargs: posts.append(url) or FakeResponse(),
+    )
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "a" * 63, "domain": FQDN_254_DOMAIN, "aliases": []}
+    ]
+
+    assert client.add_host_override_alias(FQDN_254, "nginx.lab.internal") is False
+    assert posts == []
+
+
+def test_an_oversized_alias_cannot_be_removed_and_says_so(monkeypatch, caplog):
+    """
+    An ACCEPTED REGRESSION, pinned here so nobody "fixes" it by accident.
+
+    One validation rule guards both directions. An over-long alias created before this
+    bound existed — or created by hand in the webGUI — can therefore no longer be removed
+    by this service: the removal path routes the same FQDN through the same _split_fqdn
+    and gets the same rejection. The remedy is one delete in the pfSense webGUI.
+
+    The alternative, validating only on the way in, means the removal path takes an
+    unbounded value from a container label and matches it against the config, which is
+    the barrier having a hole in it in one direction. A single rule that is occasionally
+    inconvenient beats two rules that disagree. Do not add a "removals are exempt" branch
+    to make this test pass; it is asserting the refusal, not tolerating it.
+    """
+    deletes = []
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+    monkeypatch.setattr(
+        "pfsense.requests.delete",
+        lambda url, **_kwargs: deletes.append(url) or FakeResponse(),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "a" * 63, "domain": FQDN_254_DOMAIN}
+            ],
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert client.del_host_override_alias("caddy.lab.internal", FQDN_254) is False
+
+    assert deletes == []
+    oversized = [m for m in warning_messages(caplog) if "exceeds 253 characters" in m]
+    assert len(oversized) == 1
+
+
+# --- Descriptions are cleaned, not rejected, and never escaped ------------------
+
+
+def test_clean_alias_descr_replaces_unprintable_characters():
+    """
+    It REPLACES; it does not escape. This is not sanitize_for_log.
+
+    A description is written into the pfSense configuration and shown in the webGUI, so
+    the goal is a value that is harmless to store and display, not one that round-trips
+    to the original. Escaping a newline to a literal backslash-n would put log furniture
+    into firewall config; replacing it with a space leaves something an operator reads
+    without noticing anything happened.
+    """
+    result = pfsense.clean_alias_descr("web\nserver\r\nprod")
+
+    assert result == "web server  prod"
+    assert "\n" not in result
+    assert "\\n" not in result
+
+
+def test_clean_alias_descr_truncates_at_the_cap():
+    """
+    Truncation is silent: no marker, because the marker is a log convention.
+
+    LOG_TRUNCATION_MARKER exists to tell an operator reading a log line that they are
+    seeing part of a value. Writing it into a firewall config field instead invents a
+    description that claims something about its own provenance, in data pfSense keeps.
+    """
+    result = pfsense.clean_alias_descr("a" * 10000)
+
+    assert result == "a" * pfsense.ALIAS_DESCR_MAX_CHARS
+    assert pfsense.ALIAS_DESCR_MAX_CHARS == 255
+    assert pfsense.LOG_TRUNCATION_MARKER not in result
+
+
+def test_clean_alias_descr_leaves_an_ordinary_description_unchanged():
+    """
+    The common case is the identity, em dash included.
+
+    str.isprintable() is the rule, not an ASCII allowlist: a description is free text a
+    human wrote, and mangling accents, currency symbols, or punctuation would be a
+    visible regression for a value that was never a threat.
+    """
+    assert pfsense.clean_alias_descr("My nginx webserver — prod") == "My nginx webserver — prod"
+
+
+def test_an_oversized_description_is_truncated_in_the_payload_not_rejected(monkeypatch):
+    """
+    The asymmetry with the FQDN rule, stated as a test.
+
+    A wrong FQDN is a wrong DNS record, so an over-long one is rejected. A wrong
+    description is cosmetic, so an over-long one is trimmed and the alias is still
+    created — refusing to create DNS because a label had a chatty description would be
+    the barrier causing the outage it exists to prevent. The name fields are untouched.
+    """
+    posts = []
+
+    def fake_post(url, headers, verify, timeout, json=None):
+        posts.append({"url": url, "json": json})
+        return FakeResponse()
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    assert client.add_host_override_alias(
+        "caddy.lab.internal", "nginx.lab.internal", "x" * 10000
+    ) is True
+    assert posts[0]["json"]["descr"] == "x" * 255
+    assert posts[0]["json"]["host"] == "nginx"
+    assert posts[0]["json"]["domain"] == "lab.internal"
+
+
+def test_a_hostile_description_cannot_forge_a_log_record_or_reach_the_payload_raw(
+    monkeypatch, caplog
+):
+    """
+    The description label never passed either barrier: not _split_fqdn, not the log.
+
+    pfsense.dns.description is attacker-controlled in exactly the way the alias label is,
+    and it went into the API payload untouched. A newline in it is a forged log record on
+    any line that echoes it and an unexpected control character in stored config.
+    """
+    posts = []
+
+    def fake_post(url, headers, verify, timeout, json=None):
+        posts.append({"url": url, "json": json})
+        return FakeResponse()
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.INFO):
+        assert client.add_host_override_alias(
+            "caddy.lab.internal",
+            "nginx.lab.internal",
+            "ok\n2026-08-02 12:00:00 - INFO - forged",
+        ) is True
+
+    descr = posts[0]["json"]["descr"]
+    assert "ok" in descr
+    assert "forged" in descr
+    assert "\n" not in descr
+    assert "\\n" not in descr
+    assert_no_forged_log_records(caplog)
+
+
+def test_a_cleaned_description_is_reported_once(caplog, monkeypatch):
+    """
+    Silently rewriting operator-supplied config is how a mystery starts.
+
+    One warning, naming the alias so the operator knows which container to fix. Once, not
+    once per label and not on every event: the message is diagnostic, not a running
+    commentary, and it must stay on a single line like every other log call here.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias(
+            "caddy.lab.internal", "nginx.lab.internal", "x" * 10000
+        ) is True
+
+    cleaned = [m for m in warning_messages(caplog) if "was cleaned" in m]
+    assert len(cleaned) == 1
+    assert "nginx.lab.internal" in cleaned[0]
+    assert "\n" not in cleaned[0]
+
+
+def test_an_unchanged_description_logs_no_warning(caplog, monkeypatch):
+    """
+    The warning is conditional on the value actually changing.
+
+    Warning unconditionally would fire on every ordinary alias, and a warning that always
+    fires is one an operator learns to scroll past — including the time it meant
+    something.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.INFO):
+        assert client.add_host_override_alias(
+            "caddy.lab.internal", "nginx.lab.internal", "nginx service"
+        ) is True
+
+    assert [m for m in log_messages(caplog) if "was cleaned" in m] == []
+
+
+# --- Each warning reports the cap it actually enforces --------------------------
+#
+# The tests above grep for "exceeds 253 characters" and read ALIAS_DESCR_MAX_CHARS,
+# which pins the LITERAL in the message and the VALUE of the constant — but not the tie
+# between them. Nothing there fails if a message advertises one number while the code
+# enforces another. Asserting f"capped at {pfsense.ALIAS_DESCR_MAX_CHARS} characters"
+# would be a tautology as long as the constant is still 255: the interpolated and the
+# hardcoded message are the same string. The only non-tautological form is to move the
+# constant and check that the enforced behavior and the reported number move with it.
+
+
+def test_the_description_cap_warning_reports_the_enforced_cap(monkeypatch, caplog):
+    """
+    The number in the warning must be the number the code enforced, not a copy of it.
+
+    A warning that says "capped at 255" while the code truncates at 64 sends an operator
+    to count characters against a limit that is not the limit, and the log is the only
+    place the truncation is visible at all — pfSense just holds the shortened value. This
+    is the same class of defect either cap could develop; the FQDN side avoids it by
+    interpolating its constant, and this side must do the same rather than stay correct
+    by coincidence.
+    """
+    posts = []
+
+    def fake_post(url, headers, verify, timeout, json=None):
+        posts.append({"url": url, "json": json})
+        return FakeResponse()
+
+    monkeypatch.setattr(pfsense, "ALIAS_DESCR_MAX_CHARS", 64)
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias(
+            "caddy.lab.internal", "nginx.lab.internal", "x" * 500
+        ) is True
+
+    # The cap moved, so the enforcement moved with it.
+    assert posts[0]["json"]["descr"] == "x" * 64
+    cleaned = [m for m in warning_messages(caplog) if "was cleaned" in m]
+    assert len(cleaned) == 1
+    assert "64" in cleaned[0]
+    # The load-bearing assertion: a hardcoded 255 in the message survives every other
+    # check in this suite, because every other check runs with the cap set to 255.
+    assert "255" not in cleaned[0]
+
+
+def test_the_fqdn_rejection_warning_reports_the_enforced_cap(monkeypatch, caplog):
+    """
+    The same tie on the FQDN side, which is correct today by construction rather than
+    by test.
+
+    This one passes as written, and that is the point: the pair exists so neither cap
+    depends on nobody having made the copy-paste mistake yet. Pinning only the side that
+    lost leaves the other free to regress in exactly the way this one just did.
+    """
+    monkeypatch.setattr(pfsense, "MAX_FQDN_CHARS", 20)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        result = client._split_fqdn("a" * 15 + ".lab.internal", "unit")
+
+    assert result is None
+    warnings = warning_messages(caplog)
+    assert len(warnings) == 1
+    assert "exceeds 20 characters" in warnings[0]
+    assert "unit" in warnings[0]
+    assert "253" not in warnings[0]

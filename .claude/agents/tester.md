@@ -28,6 +28,7 @@ Behavior that would be dangerous or invisible if it broke:
 
 - Anything that changes what is logged — the prohibition on logging tokens, secrets, auth headers, or API response bodies is enforced by `test_http_error_logs_status_without_response_body`. New error paths need the same guard.
 - Anything touching `_split_fqdn`. It is the injection barrier between container labels and API payloads; test hostile input, not just malformed input.
+- Any bounded validator — a length cap, a count cap, anything with an off-by-one to get wrong — needs at-limit, one-over, and one-under coverage, not just a hostile or oversized example. `MAX_FQDN_CHARS` and `ALIAS_DESCR_MAX_CHARS` are the kind of boundary where "rejects something huge" passes even when the real cutoff is wrong by one.
 - Anything touching TLS: `verify_ssl` defaults, the `PFSENSE_CA_BUNDLE` precedence, and that only the exact string `"false"` disables verification.
 - Both halves of a mutation — the mutation call *and* the `/apply` call, including the case where apply fails after the mutation succeeded.
 - The failure asymmetry: pfSense errors log and return `False`; Docker event-stream errors re-raise and exit non-zero.
