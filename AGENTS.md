@@ -90,6 +90,27 @@ That status poll passes `attempts=1` to `_request`. Do not let it use the defaul
 
 **Never apply once per item in a loop.** `add_aliases_on_startup` stages every alias with `apply=False` and calls `apply_changes()` exactly once at the end, skipping it entirely when nothing staged. Applying per alias meant 20 containers cost 20 unbound reloads and ~40s of DNS disruption, with overlapping async reloads a likely cause of dropped updates. `tests/test_main.py::test_startup_scan_applies_once_for_many_aliases` pins this by counting.
 
+### Event-driven applies are coalesced
+
+The same burst arrives through the event loop — a `docker compose up` of twenty labeled services fires twenty events. `process_start_event` and `process_stop_event` therefore consult `should_apply_immediately()`:
+
+- The **first** change after a quiet period applies immediately, so a lone container start is as fast as it was before coalescing.
+- Everything during the burst that follows is staged with `apply=False` and flushed by one `apply_changes()`.
+
+`flush_pending_changes()` fires when `APPLY_QUIET_SECONDS` (default 10) passes with no new change, when `APPLY_MAX_WAIT_SECONDS` (default 60) caps the wait so continuous churn cannot starve the apply, or with `force=True` on shutdown. Twenty services cost two reloads instead of twenty; `test_a_burst_of_starts_costs_two_applies_not_twenty` pins it.
+
+Coalescing state (`PENDING_CHANGES`, `PENDING_SINCE`, `LAST_CHANGE_AT`, `LAST_APPLY_AT`) is module level and measured with `time.monotonic()`, so a wall-clock adjustment cannot strand pending changes. Note that `LAST_APPLY_AT = 0.0` reads as *long ago*, not *just now* — tests that need "an apply just happened" must set `time.monotonic()`.
+
+**`cleanup()` flushes before exit.** A SIGTERM with staged changes would otherwise leave them in the config but never live. It guards on `NAMESERVER is not None`, since a signal can arrive before `main()` constructs it, and swallows flush errors so a broken apply cannot block shutdown. Docker's default 10s stop grace can still cut a slow apply short; the changes stay staged and go live on the next apply.
+
+### The event loop yields window ticks
+
+`iter_events()` replaces a single blocking `client.events()` with contiguous bounded windows (`since`/`until`, `EVENT_WINDOW_SECONDS`), yielding `None` at each boundary so `main()` can call `flush_pending_changes()`. This keeps the loop **single threaded** — no timer thread, no lock, no signal-handler reentrancy — which is why the resilience contract still holds.
+
+Windows are contiguous, so events between them are still delivered. An event landing exactly on a boundary may be delivered twice; that is harmless because adding an existing alias or removing an absent one is already detected and logged.
+
+Tests drive `main()` by monkeypatching `main.iter_events` with a finite iterable. Do not stub `client.events` for loop tests — `iter_events` loops forever by design, so main() would never return.
+
 With `apply=False`, a `True` return means **staged in the pfSense configuration but not yet live**. Staged changes persist and go live on the next successful apply.
 
 `add_host_override_alias` first calls `find_host_name(alias_fqdn)` to reject an alias already used as a host override or alias anywhere, then resolves the parent host override — the override must already exist in pfSense; this service never creates one.

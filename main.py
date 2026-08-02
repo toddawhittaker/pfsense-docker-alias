@@ -7,6 +7,7 @@ DNS aliases in pfSense based on labels defined in the container configuration.
 
 import os
 import sys
+import time
 import signal
 import logging
 import docker
@@ -39,11 +40,43 @@ def get_env_var(var_name):
         sys.exit(1)
     return value
 
+def get_positive_float_env(var_name, default):
+    """Read a positive float environment variable, falling back to default if unusable."""
+    raw = os.getenv(var_name)
+    if raw is None:
+        return default
+
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(f"Ignoring invalid {var_name}='{raw}'; using {default}.")
+        return default
+
+    if value <= 0:
+        logger.warning(f"Ignoring non-positive {var_name}='{raw}'; using {default}.")
+        return default
+
+    return value
+
 PFSENSE_HOSTNAME = get_env_var("PFSENSE_HOSTNAME")
 PFSENSE_API_TOKEN = get_env_var("PFSENSE_API_TOKEN")
 PFSENSE_VERIFY_SSL = os.getenv("PFSENSE_VERIFY_SSL", "true").lower() != "false"
 PFSENSE_CA_BUNDLE = os.getenv("PFSENSE_CA_BUNDLE")
 ADD_ALIASES_ON_STARTUP = os.getenv("ADD_ALIASES_ON_STARTUP", "false").lower() == "true"
+# Coalescing: a burst of container events (a compose up) should cost one reload, not
+# one per container. The first change in a quiet period still applies immediately so a
+# lone container start is as fast as it ever was.
+APPLY_QUIET_SECONDS = get_positive_float_env("APPLY_QUIET_SECONDS", 10.0)
+APPLY_MAX_WAIT_SECONDS = get_positive_float_env("APPLY_MAX_WAIT_SECONDS", 60.0)
+# How often the event loop regains control to check whether a flush is due.
+EVENT_WINDOW_SECONDS = 2.0
+
+# Coalescing state. Elapsed time uses a monotonic clock so a wall-clock adjustment
+# cannot strand pending changes.
+PENDING_CHANGES = 0
+PENDING_SINCE = None
+LAST_CHANGE_AT = None
+LAST_APPLY_AT = None
 
 # Initialize Docker client
 try:
@@ -109,6 +142,12 @@ def add_aliases_on_startup():
 def cleanup(_signum, _frame):
     """Cleanup actions to perform when the script exits."""
     logger.info("Shutting down gracefully...")
+    try:
+        if NAMESERVER is not None:
+            flush_pending_changes(force=True)
+    except Exception as e: # pylint: disable=broad-except
+        _handle_error(e, "cleanup")
+
     try:
         client.close()
     except docker.errors.DockerException as e:
@@ -194,15 +233,113 @@ def handle_container_event(event):
         logger.info(f"Container '{container.name}' is stopping...")
         process_stop_event(alias_config["host_override_fqdn"], alias_config["alias_fqdn"])
 
+def should_apply_immediately():
+    """
+    True when a change can be applied on its own rather than coalesced.
+
+    The first change after a quiet period applies immediately, so a single container
+    start is as fast as it was before coalescing. Anything arriving during the burst
+    that follows is staged and flushed together.
+    """
+    if PENDING_CHANGES:
+        return False
+    return LAST_APPLY_AT is None or time.monotonic() - LAST_APPLY_AT >= APPLY_QUIET_SECONDS
+
+def _record_staged():
+    """Note that a change is staged in pfSense but not yet applied."""
+    global PENDING_CHANGES, PENDING_SINCE, LAST_CHANGE_AT  # pylint: disable=global-statement
+    PENDING_CHANGES += 1
+    LAST_CHANGE_AT = time.monotonic()
+    if PENDING_SINCE is None:
+        PENDING_SINCE = LAST_CHANGE_AT
+
+def _record_applied():
+    """Reset coalescing state after changes have been applied."""
+    global PENDING_CHANGES, PENDING_SINCE, LAST_CHANGE_AT, LAST_APPLY_AT  # pylint: disable=global-statement
+    PENDING_CHANGES = 0
+    PENDING_SINCE = None
+    LAST_CHANGE_AT = None
+    LAST_APPLY_AT = time.monotonic()
+
+def _flush_reason(force):
+    """Describe why a flush is due, or None when it is not yet time."""
+    if force:
+        return "shutdown"
+    if time.monotonic() - LAST_CHANGE_AT >= APPLY_QUIET_SECONDS:
+        return f"{APPLY_QUIET_SECONDS:g}s without a new event"
+    if time.monotonic() - PENDING_SINCE >= APPLY_MAX_WAIT_SECONDS:
+        return f"{APPLY_MAX_WAIT_SECONDS:g}s maximum wait"
+    return None
+
+def flush_pending_changes(force=False):
+    """
+    Apply coalesced changes once the quiet window passes, the max wait elapses, or on
+    shutdown. Does nothing when no changes are pending.
+    """
+    if not PENDING_CHANGES:
+        return
+
+    reason = _flush_reason(force)
+    if reason is None:
+        return
+
+    count = PENDING_CHANGES
+    logger.info(f"Applying {count} coalesced change(s) after {reason}...")
+    applied = NAMESERVER.apply_changes()
+    _record_applied()
+
+    if not applied:
+        logger.error(
+            f"{count} change(s) are staged in the pfSense configuration but were not "
+            "applied. They will take effect on the next successful apply."
+        )
+
 def process_start_event(host_override_fqdn, alias_fqdn, alias_descr):
     """Process a container start event and add an alias if necessary."""
-    NAMESERVER.add_host_override_alias(host_override_fqdn, alias_fqdn, alias_descr)
+    immediate = should_apply_immediately()
+    if not NAMESERVER.add_host_override_alias(
+        host_override_fqdn, alias_fqdn, alias_descr, apply=immediate
+    ):
+        return
+
+    if immediate:
+        _record_applied()
+    else:
+        _record_staged()
 
 def process_stop_event(host_override_fqdn, alias_fqdn):
     """Process a container stop event and remove an alias if necessary."""
-    NAMESERVER.del_host_override_alias(host_override_fqdn, alias_fqdn)
+    immediate = should_apply_immediately()
+    if not NAMESERVER.del_host_override_alias(host_override_fqdn, alias_fqdn, apply=immediate):
+        return
+
+    if immediate:
+        _record_applied()
+    else:
+        _record_staged()
 
 NAMESERVER = None
+
+def iter_events():
+    """
+    Yield Docker events, with a None tick at every window boundary.
+
+    `client.events()` blocks indefinitely, which would leave nowhere to notice that a
+    quiet period has elapsed and pending changes are due. Streaming bounded windows
+    hands control back on a fixed cadence without a timer thread, keeping the event
+    loop single threaded and the signal handlers simple.
+
+    Windows are contiguous — each starts where the previous ended — so events arriving
+    between windows are still delivered. An event landing exactly on a boundary may be
+    delivered twice; that is harmless, because adding an existing alias or removing an
+    absent one is already detected and logged rather than duplicated.
+    """
+    since = time.time()
+    while True:
+        until = time.time() + EVENT_WINDOW_SECONDS
+        yield from client.events(since=since, until=until, decode=True)
+        since = until
+        yield None
 
 def main():
     """Main program loop to listen for Docker events."""
@@ -220,8 +357,11 @@ def main():
 
     try:
         logger.info("Listening for container start/stop events.")
-        for event in client.events(decode=True):
-            if event.get('Type') == 'container' and event.get('Action') in ['start', 'stop', 'die']:
+        for event in iter_events():
+            if event is None:
+                flush_pending_changes()
+            elif (event.get('Type') == 'container'
+                  and event.get('Action') in ['start', 'stop', 'die']):
                 handle_container_event(event)
     except docker.errors.DockerException as e:
         _handle_error(e, "main")

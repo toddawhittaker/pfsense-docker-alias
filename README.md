@@ -123,6 +123,7 @@ docker run \
 - Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`.
 - Ensure the required environment variables (`PFSENSE_HOSTNAME`, `PFSENSE_API_TOKEN`) are correctly set.
 - If using `ADD_ALIASES_ON_STARTUP`, ensure all currently running containers are labeled correctly before starting the service. Startup sync is additive and does not prune stale aliases.
+- A single container start applies right away. When several containers start at once — a `docker compose up`, or a startup scan — the changes are batched and applied in one DNS resolver reload rather than one per alias. A lone alias is therefore live in seconds, while a burst of twenty costs two reloads instead of twenty. Tune with `APPLY_QUIET_SECONDS` if your services start staggered over a longer period.
 - Replace `pfsense.lab.internal` with the fully qualified hostname or IP address of your pfSense firewall.
 - Mounting `/var/run/docker.sock` gives this service broad access to the Docker host. Run it only on trusted hosts and with a pfSense API token scoped as narrowly as your installation allows.
 
@@ -167,6 +168,8 @@ Use these environment variables in your `docker-compose.yaml` or `docker run` co
 | `PFSENSE_VERIFY_SSL`     | No       | `true`  | Validate the pfSense HTTPS certificate. Set to `false` only if certificate validation is not possible. |
 | `PFSENSE_CA_BUNDLE`      | No       | None    | Path inside the container to a custom CA bundle for pfSense certificate validation. |
 | `ADD_ALIASES_ON_STARTUP` | No       | `false` | Add aliases for currently running labeled containers on startup. |
+| `APPLY_QUIET_SECONDS`    | No       | `10`    | Seconds without a new container event before staged DNS changes are applied together. Applying reloads the pfSense DNS resolver and takes a few seconds, so bursts are batched into one reload. |
+| `APPLY_MAX_WAIT_SECONDS` | No       | `60`    | Upper bound on how long staged changes wait, so continuous container churn cannot delay them indefinitely. |
 
 ### Docker Labels
 Use these labels on your services to automatically generate aliases in pfSense DNS.
