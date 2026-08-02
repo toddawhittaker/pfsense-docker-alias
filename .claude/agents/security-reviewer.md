@@ -15,6 +15,8 @@ A daemon holding a pfSense API token, mounting `/var/run/docker.sock`, and turni
 
 It authenticates DNS changes on a firewall. It must never reach logs, error messages, exception text, or CI output. `_handle_api_error` deliberately logs the exception and status code but **not** `response.text`, and `test_http_error_logs_status_without_response_body` pins that. Any new error path, debug line, or re-raise that widens what gets logged is a finding. So is anything that puts the token in a URL rather than the `X-API-Key` header.
 
+`PFSense._headers()` is the single construction point for those headers, and `X-API-Key` should appear exactly once in `pfsense.py` — inside it. A request that builds the header dict inline is a finding even when it is byte-identical today, because it silently opts out of any future hardening of `_headers()`. `grep -c X-API-Key pfsense.py` is the check.
+
 ### 2. TLS trust
 
 `PFSENSE_VERIFY_SSL` is fail-secure: true unless the value lowercases to exactly `"false"`. `PFSENSE_CA_BUNDLE` takes precedence and is passed straight to `requests`' `verify=`. Treat as findings: any change making verification easier to disable, any default flip, any broadening of what counts as "false", and any call path that forgets to pass `verify=` at all.

@@ -307,18 +307,13 @@ class PFSense:
 
     def get_all_host_overrides(self):
         """Returns all the host overrides defined in pfSense"""
-        # Define the headers for authentication
-        headers = {
-            'X-API-Key': f"{self.pfsense_api_key}",
-            'Content-Type': 'application/json'
-        }
         # Fetch existing host overrides to find the one to update
         try:
             response = self._request(
                 requests.get,
                 "get_all_host_overrides",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_overrides',
-                headers=headers,
+                headers=self._headers(),
                 verify=self.verify_ssl,
                 timeout=10
             )
