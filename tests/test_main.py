@@ -4,6 +4,8 @@ import sys
 import time
 import types
 
+import pfsense
+
 
 class DockerException(Exception):
     pass
@@ -1055,3 +1057,210 @@ def test_a_coalesced_removal_is_staged_like_an_addition(monkeypatch):
 
     assert nameserver.staged == [("gone.lab.internal", False)]
     assert main.PENDING_CHANGES == 1
+
+
+# --- Log forgery: anyone who can start a container controls these values -------
+
+
+def log_messages(caplog):
+    """The formatted message of each captured record, without any traceback."""
+    return [record.getMessage() for record in caplog.records]
+
+
+def assert_no_forged_log_records(caplog):
+    """
+    No captured record may contain a raw newline or carriage return.
+
+    caplog.text joins records with newlines, so a substring check on it cannot prove
+    single-line-ness — a forged record and a genuine one look identical there. Assert
+    per record instead. record.getMessage() excludes exc_info, so _handle_error's
+    deliberate multi-line traceback is not swept up by this check.
+    """
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "\n" not in message, message
+        assert "\r" not in message, message
+
+
+def test_startup_staging_log_cannot_be_forged_by_a_label(monkeypatch, caplog):
+    """
+    The startup scan logs the alias label and the container name before pfSense has
+    seen either. A newline in one fabricates a complete, syntactically valid record.
+    """
+    main, fake_client = load_main(monkeypatch)
+    staged = []
+    applies = []
+    hostile_alias = (
+        "svc\n2026-08-02 12:00:00 - INFO - "
+        "Alias attacker.lab.internal added to host override parent.lab.internal"
+    )
+    escaped_alias = (
+        "svc\\n2026-08-02 12:00:00 - INFO - "
+        "Alias attacker.lab.internal added to host override parent.lab.internal"
+    )
+    hostile_name = "svc\r2026-08-02 12:00:00 - INFO - forged"
+    escaped_name = "svc\\r2026-08-02 12:00:00 - INFO - forged"
+    fake_client.containers.list = lambda: [_labeled_container(hostile_name, hostile_alias)]
+    main.NAMESERVER = _recording_nameserver(staged, applies)
+
+    with caplog.at_level(logging.INFO):
+        main.add_aliases_on_startup()
+
+    assert_no_forged_log_records(caplog)
+    staging = [m for m in log_messages(caplog) if "Staging alias" in m]
+    assert len(staging) == 1
+    # Both values on the line are attacker supplied, and the evidence survives escaped.
+    assert escaped_alias in staging[0]
+    assert escaped_name in staging[0]
+
+
+def test_container_start_and_stop_logs_cannot_be_forged_by_a_container_name(
+    monkeypatch, caplog
+):
+    """A container name is chosen by whoever starts the container, and is logged raw."""
+    main, fake_client = load_main(monkeypatch)
+    hostile_name = "nginx\n2026-08-02 12:00:00 - INFO - Alias attacker.lab.internal added"
+    escaped_name = "nginx\\n2026-08-02 12:00:00 - INFO - Alias attacker.lab.internal added"
+    fake_client.container = types.SimpleNamespace(
+        name=hostile_name,
+        attrs={
+            "Config": {
+                "Labels": {
+                    "pfsense.dns.override": "caddy.lab.internal",
+                    "pfsense.dns.alias": "nginx.lab.internal",
+                    "pfsense.dns.remove_on_stop": "true",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+    monkeypatch.setattr(main, "process_stop_event", lambda *_args: None)
+
+    with caplog.at_level(logging.INFO):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
+
+    assert_no_forged_log_records(caplog)
+    messages = log_messages(caplog)
+    assert f"Container '{escaped_name}' is starting..." in messages
+    assert f"Container '{escaped_name}' is stopping..." in messages
+
+
+def test_container_not_found_warning_cannot_be_forged(monkeypatch, caplog):
+    """The Docker exception text carries the container id taken from the event."""
+    main, fake_client = load_main(monkeypatch)
+    hostile = "no such container: abc\n2026-08-02 12:00:00 - INFO - forged"
+    escaped = "no such container: abc\\n2026-08-02 12:00:00 - INFO - forged"
+
+    def gone(_container_id):
+        raise DockerNotFound(hostile)
+
+    fake_client.containers.get = gone
+
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    assert_no_forged_log_records(caplog)
+    missing = [m for m in log_messages(caplog) if "Container not found" in m]
+    assert len(missing) == 1
+    assert escaped in missing[0]
+
+
+def test_handle_error_escapes_the_message_but_keeps_the_traceback(monkeypatch, caplog):
+    """
+    The escape must not become a global "strip newlines" scrubber.
+
+    _handle_error logs with exc_info=True on purpose; that traceback is multi-line and
+    must stay multi-line. Only the interpolated message is attacker influenced.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    hostile = "boom\n2026-08-02 12:00:00 - INFO - Alias attacker.lab.internal added"
+    escaped = "boom\\n2026-08-02 12:00:00 - INFO - Alias attacker.lab.internal added"
+
+    with caplog.at_level(logging.ERROR):
+        try:
+            raise RuntimeError(hostile)
+        except RuntimeError as error:
+            main._handle_error(error, "handle_container_event")
+
+    assert_no_forged_log_records(caplog)
+    record = caplog.records[-1]
+    assert escaped in record.getMessage()
+    # The developer-supplied context is untouched, and the traceback survives.
+    assert "Error in handle_container_event:" in record.getMessage()
+    assert record.exc_info is not None
+    assert "Traceback" in caplog.text
+
+
+def test_oversized_label_values_are_truncated_in_logs(monkeypatch, caplog):
+    """A megabyte-long label must not become a megabyte of log."""
+    main, fake_client = load_main(monkeypatch)
+    oversized = "a" * 10000
+    fake_client.container = types.SimpleNamespace(
+        name=oversized,
+        attrs={
+            "Config": {
+                "Labels": {
+                    "pfsense.dns.override": "caddy.lab.internal",
+                    "pfsense.dns.alias": "nginx.lab.internal",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+
+    with caplog.at_level(logging.INFO):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    starting = [m for m in log_messages(caplog) if "is starting" in m]
+    assert len(starting) == 1
+    assert "a" * pfsense.LOG_VALUE_MAX_CHARS in starting[0]
+    assert "a" * (pfsense.LOG_VALUE_MAX_CHARS + 1) not in starting[0]
+    assert starting[0].count(pfsense.LOG_TRUNCATION_MARKER) == 1
+
+
+def test_docker_client_init_failure_log_cannot_forge_a_log_record(monkeypatch, caplog):
+    """
+    An import-time log site is testable, and this one is enforced rather than assumed.
+
+    caplog attaches to the root logger before the test body runs, so records emitted
+    while `main` is being imported are captured like any other. The Docker daemon's
+    error text is off-box string data, which makes this a real forgery site, not a
+    provably-no-op one.
+    """
+    hostile = "boom\n2026-08-02 12:00:00 - INFO - forged"
+
+    def unavailable():
+        raise DockerException(hostile)
+
+    fake_docker = types.SimpleNamespace(
+        from_env=unavailable,
+        errors=types.SimpleNamespace(DockerException=DockerException, NotFound=DockerNotFound),
+    )
+    monkeypatch.setenv("PFSENSE_HOSTNAME", "pfsense.lab.internal")
+    monkeypatch.setenv("PFSENSE_API_TOKEN", "test-token")
+    monkeypatch.delenv("ADD_ALIASES_ON_STARTUP", raising=False)
+    monkeypatch.delenv("PFSENSE_VERIFY_SSL", raising=False)
+    monkeypatch.delenv("PFSENSE_CA_BUNDLE", raising=False)
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+    # A module whose import raises is removed from sys.modules by the import machinery,
+    # so `main` is left unimported here and later load_main() calls are unaffected.
+    sys.modules.pop("main", None)
+
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            importlib.import_module("main")
+        except SystemExit as exc:
+            # The escape must not disturb the import-time exit contract: CI's container
+            # smoke test asserts the image exits 1 when it cannot reach Docker.
+            assert exc.code == 1
+        else:
+            raise AssertionError("import did not exit")
+
+    assert_no_forged_log_records(caplog)
+    critical = [m for m in log_messages(caplog) if "Error initializing Docker client" in m]
+    assert len(critical) == 1
+    assert "\\n" in critical[0]
+    assert "boom" in critical[0]
+    assert "forged" in critical[0]
+    assert "Error initializing Docker client" in caplog.text

@@ -69,6 +69,31 @@ APPLY_POLL_ATTEMPTS = 15
 APPLY_POLL_DELAY_SECONDS = 1
 DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
+# The injection barrier for logs, as _split_fqdn is for API payloads. Externally
+# supplied values (container labels, API responses) must never reach a log call
+# unsanitized, or a newline can fabricate a complete, syntactically valid log record.
+LOG_VALUE_MAX_CHARS = 512
+LOG_TRUNCATION_MARKER = "...(truncated)"
+
+
+def sanitize_for_log(value):
+    """
+    Render a value safely for a log message.
+
+    Escapes every non-printable character (including newline, carriage return, and
+    line-separator code points) so a hostile value cannot fabricate a log record, then
+    truncates. Escaping before truncating matters: truncating first would let a long run
+    of control characters expand into several times as much log output after escaping.
+    """
+    text = value if isinstance(value, str) else str(value)
+    escaped = "".join(
+        c if c.isprintable() and c != "\\" else c.encode("unicode_escape").decode("ascii")
+        for c in text
+    )
+    if len(escaped) > LOG_VALUE_MAX_CHARS:
+        return escaped[:LOG_VALUE_MAX_CHARS] + LOG_TRUNCATION_MARKER
+    return escaped
+
 class PFSense:
     """
     An abstraction of the pfSense server.
@@ -93,11 +118,11 @@ class PFSense:
 
         labels = fqdn.split('.')
         if len(labels) < 2 or any(not label for label in labels):
-            logger.warning(f"Invalid FQDN '{fqdn}' during {context}.")
+            logger.warning(f"Invalid FQDN '{sanitize_for_log(fqdn)}' during {context}.")
             return None
 
         if not all(DNS_LABEL_PATTERN.fullmatch(label) for label in labels):
-            logger.warning("Invalid FQDN label during %s.", context)
+            logger.warning(f"Invalid FQDN label '{sanitize_for_log(fqdn)}' during {context}.")
             return None
 
         return labels[0], '.'.join(labels[1:])
@@ -199,7 +224,7 @@ class PFSense:
                 return False
             response.raise_for_status()
             data = response.json().get('data', {})
-            return bool(data.get('applied'))
+            return data.get('applied') is True
         except (requests.RequestException, ValueError, AttributeError) as e:
             self._handle_api_error(e, "apply_changes_status")
             return False
@@ -210,7 +235,7 @@ class PFSense:
         :param error: The exception raised during the API call.
         :param context: Additional context about the API call.
         """
-        logger.error(f"API call failed during '{context}': {error}")
+        logger.error(f"API call failed during '{context}': {sanitize_for_log(error)}")
         if isinstance(error, requests.HTTPError):
             logger.error(f"HTTP Status Code: {error.response.status_code}")
 
@@ -317,18 +342,22 @@ class PFSense:
         alias = self.find_host_name(alias_fqdn)
         if alias is not None:
             logger.warning(
-                f"Alias {alias_fqdn} already mapped to {alias['host']}.{alias['domain']}."
+                f"Alias {sanitize_for_log(alias_fqdn)} already mapped to "
+                f"{sanitize_for_log(alias.get('host'))}.{sanitize_for_log(alias.get('domain'))}."
             )
             return False
 
         host_override = self.find_host_name(host_override_fqdn)
         if not host_override:
-            logger.warning(f"Host override {host_override_fqdn} not found.")
+            logger.warning(f"Host override {sanitize_for_log(host_override_fqdn)} not found.")
             return False
 
         parent_id = host_override.get("id")
         if parent_id is None:
-            logger.error(f"Host override {host_override_fqdn} has no id; cannot add alias.")
+            logger.error(
+                f"Host override {sanitize_for_log(host_override_fqdn)} has no id; "
+                "cannot add alias."
+            )
             return False
 
         data = {
@@ -364,9 +393,15 @@ class PFSense:
         if apply:
             if not self.apply_changes():
                 return False
-            logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
+            logger.info(
+                f"Alias {sanitize_for_log(alias_fqdn)} added to host override "
+                f"{sanitize_for_log(host_override_fqdn)}."
+            )
         else:
-            logger.info(f"Alias {alias_fqdn} staged for host override {host_override_fqdn}.")
+            logger.info(
+                f"Alias {sanitize_for_log(alias_fqdn)} staged for host override "
+                f"{sanitize_for_log(host_override_fqdn)}."
+            )
 
         return True
 
@@ -384,18 +419,23 @@ class PFSense:
         """
         host_override = self.find_host_name(host_override_fqdn)
         if not host_override:
-            logger.warning(f"Host override {host_override_fqdn} not found.")
+            logger.warning(f"Host override {sanitize_for_log(host_override_fqdn)} not found.")
             return False
 
         alias = self.find_alias_in_host_override(host_override, alias_fqdn)
         if not alias:
-            logger.warning(f"Alias {alias_fqdn} not found in host override {host_override_fqdn}.")
+            logger.warning(
+                f"Alias {sanitize_for_log(alias_fqdn)} not found in host override "
+                f"{sanitize_for_log(host_override_fqdn)}."
+            )
             return False
 
         parent_id = alias.get("parent_id")
         alias_id = alias.get("id")
         if parent_id is None or alias_id is None:
-            logger.error(f"Alias {alias_fqdn} is missing an id; cannot remove it.")
+            logger.error(
+                f"Alias {sanitize_for_log(alias_fqdn)} is missing an id; cannot remove it."
+            )
             return False
 
         data = {
@@ -427,8 +467,14 @@ class PFSense:
         if apply:
             if not self.apply_changes():
                 return False
-            logger.info(f"Alias {alias_fqdn} removed from host override {host_override_fqdn}.")
+            logger.info(
+                f"Alias {sanitize_for_log(alias_fqdn)} removed from host override "
+                f"{sanitize_for_log(host_override_fqdn)}."
+            )
         else:
-            logger.info(f"Alias {alias_fqdn} staged for removal from {host_override_fqdn}.")
+            logger.info(
+                f"Alias {sanitize_for_log(alias_fqdn)} staged for removal from "
+                f"{sanitize_for_log(host_override_fqdn)}."
+            )
 
         return True

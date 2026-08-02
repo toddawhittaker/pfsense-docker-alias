@@ -27,9 +27,48 @@ def http_error():
     return error
 
 
-def applied_status_get(applied=True):
-    """A requests.get stand-in for the apply endpoint's status poll."""
-    return lambda **_kwargs: FakeResponse({"data": {"applied": applied}})
+def applied_status_get(applied=True, calls=None):
+    """
+    A requests.get stand-in for the apply endpoint's status poll.
+
+    The signature is explicit rather than `**_kwargs` on purpose. A helper that swallows
+    every kwarg swallowed a hardcoded `verify=False` in _changes_applied() too — mutation
+    testing proved the whole suite stayed green. Naming the four kwargs turns a *dropped*
+    one into a TypeError at every call site; pass `calls` to catch a *weakened* one.
+    """
+    def fake_get(url, headers, verify, timeout):
+        if calls is not None:
+            calls.append(
+                {
+                    "url": url,
+                    "headers": headers,
+                    "verify": verify,
+                    "timeout": timeout,
+                }
+            )
+        return FakeResponse({"data": {"applied": applied}})
+
+    return fake_get
+
+
+def log_messages(caplog):
+    """The formatted message of each captured record, without any traceback."""
+    return [record.getMessage() for record in caplog.records]
+
+
+def assert_no_forged_log_records(caplog):
+    """
+    No captured record may contain a raw newline or carriage return.
+
+    caplog.text joins records with newlines, so a substring check on it cannot prove
+    single-line-ness — a forged record and a genuine one look identical there. Assert
+    per record instead. record.getMessage() excludes exc_info, so a deliberate
+    multi-line traceback is not swept up by this check.
+    """
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "\n" not in message, message
+        assert "\r" not in message, message
 
 
 def test_get_all_host_overrides_constructs_request(monkeypatch):
@@ -902,3 +941,476 @@ def test_staging_logs_staged_not_added(monkeypatch, caplog):
     assert "staged for removal" in caplog.text
     assert "added to host override" not in caplog.text
     assert "removed from host override" not in caplog.text
+
+
+# --- TLS verification on the apply-status poll --------------------------------
+
+
+def test_apply_changes_status_poll_constructs_request(monkeypatch):
+    """
+    The status poll is the newest request site and was the only one with no exact-call
+    assertion. Mutation testing proved a hardcoded `verify=False` there passed the whole
+    suite — exactly the silent TLS weakening these assertions exist to catch.
+    """
+    gets = []
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(calls=gets))
+
+    # A CA bundle path is a verify value that neither True nor False can accidentally
+    # match, so "tracks self.verify_ssl" is distinguishable from "equals a constant".
+    client = PFSense("pfsense.lab.internal", "secret-token", ca_bundle="/etc/ssl/pfsense-ca.pem")
+
+    assert client.apply_changes() is True
+    assert gets == [
+        {
+            "url": "https://pfsense.lab.internal/api/v2/services/dns_resolver/apply",
+            "headers": {
+                "X-API-Key": "secret-token",
+                "Content-Type": "application/json",
+            },
+            "verify": "/etc/ssl/pfsense-ca.pem",
+            "timeout": 10,
+        }
+    ]
+
+
+def test_apply_changes_status_poll_honours_disabled_tls_verification(monkeypatch):
+    """With the test above, this pins 'tracks self.verify_ssl', not 'equals a constant'."""
+    gets = []
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(calls=gets))
+
+    client = PFSense("pfsense.lab.internal", "secret-token", verify_ssl=False)
+
+    assert client.apply_changes() is True
+    assert [call["verify"] for call in gets] == [False]
+
+
+# --- Apply confirmation fails closed ------------------------------------------
+
+
+def test_apply_changes_rejects_a_non_boolean_applied_status(monkeypatch, caplog):
+    """
+    Only the boolean True confirms a reload.
+
+    bool(data.get('applied')) failed open: the JSON string "false" is truthy, so a
+    hostile or buggy response reported the reload as applied. Including "true" and 1
+    here makes the strictness deliberate rather than incidental — an unconfirmed reload
+    is indistinguishable from a lost update, so it must fail closed.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+
+    for status in ("false", "true", 1, 0, "applied", "True", None, {}, []):
+        polls = []
+
+        def counting_get(_status=status, _polls=polls, **_kwargs):
+            _polls.append("get")
+            return FakeResponse({"data": {"applied": _status}})
+
+        monkeypatch.setattr("pfsense.requests.get", counting_get)
+
+        client = PFSense("pfsense.lab.internal", "secret-token")
+
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            assert client.apply_changes() is False, status
+
+        assert len(polls) == pfsense.APPLY_POLL_ATTEMPTS, status
+        assert "remain staged" in caplog.text, status
+
+
+def test_apply_changes_treats_a_non_dict_data_as_not_applied(monkeypatch):
+    """
+    A non-dict `data` must degrade to "not applied", never raise out of this module.
+
+    No new guard is needed: response.json().get('data', {}) raises AttributeError for a
+    non-dict body and data.get('applied') raises it for None/str/list/int, and
+    AttributeError is already caught. This pins that, so the guard cannot be dropped.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+
+    for payload in ({"data": None}, {"data": "applied"}, {"data": ["applied"]}, {"data": 1}):
+        monkeypatch.setattr(
+            "pfsense.requests.get",
+            lambda _payload=payload, **_kwargs: FakeResponse(_payload),
+        )
+
+        client = PFSense("pfsense.lab.internal", "secret-token")
+
+        assert client.apply_changes() is False, payload
+
+
+def test_a_string_false_status_keeps_unapplied_changes_set(monkeypatch):
+    """
+    The invariant a fail-open confirmation actually endangers.
+
+    Clearing unapplied_changes on an unconfirmed reload strands the change: nothing is
+    pending, so nothing ever retries the apply and the alias never goes live.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(applied="false"))
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.unapplied_changes = True
+
+    assert client.apply_changes() is False
+    assert client.unapplied_changes is True
+
+
+# --- sanitize_for_log: the injection barrier for logs --------------------------
+
+
+def test_sanitize_for_log_escapes_control_characters():
+    """Control characters must appear escaped, so no label can fabricate a log record."""
+    assert pfsense.sanitize_for_log("a\nb") == "a\\nb"
+    assert pfsense.sanitize_for_log("a\rb") == "a\\rb"
+    assert pfsense.sanitize_for_log("a\tb") == "a\\tb"
+    assert pfsense.sanitize_for_log("a\x00b") == "a\\x00b"
+    assert pfsense.sanitize_for_log("a\x1bb") == "a\\x1bb"
+    # U+2028/U+2029 break lines for some log viewers even though they are not \n.
+    assert pfsense.sanitize_for_log("a\u2028b") == "a\\u2028b"
+    assert pfsense.sanitize_for_log("a\u2029b") == "a\\u2029b"
+    # Backslash itself escapes, so the mapping is injective: a literal backslash-n
+    # cannot be typed to render identically to an escaped newline.
+    assert pfsense.sanitize_for_log("a\\nb") == "a\\\\nb"
+    assert pfsense.sanitize_for_log("a\\nb") != pfsense.sanitize_for_log("a\nb")
+
+
+def test_sanitize_for_log_preserves_ordinary_values():
+    """
+    On printable values the helper is the identity, so operator-facing wording is
+    unchanged. That is why no existing assertion moves, and why repr()/!r was rejected.
+    """
+    assert pfsense.sanitize_for_log("nginx.lab.internal") == "nginx.lab.internal"
+    assert pfsense.sanitize_for_log("nginx service") == "nginx service"
+    # Printable non-ASCII survives; a blanket unicode_escape would mangle it.
+    assert pfsense.sanitize_for_log("café") == "café"
+    assert pfsense.sanitize_for_log(None) == "None"
+    assert pfsense.sanitize_for_log(12345) == "12345"
+    assert pfsense.sanitize_for_log(["nginx", "lab"]) == "['nginx', 'lab']"
+
+
+def test_sanitize_for_log_truncates_oversized_values():
+    """
+    Escape first, then truncate.
+
+    Truncating first would let a 512-character control-character run expand to roughly
+    3 KB of log, so the all-newlines case is what actually pins the ordering.
+    """
+    bound = pfsense.LOG_VALUE_MAX_CHARS + len(pfsense.LOG_TRUNCATION_MARKER)
+
+    plain = pfsense.sanitize_for_log("a" * 10000)
+    assert len(plain) == bound
+    assert plain.endswith(pfsense.LOG_TRUNCATION_MARKER)
+    # Count the leading run rather than every "a": the marker contains one of its own.
+    assert plain.startswith("a" * pfsense.LOG_VALUE_MAX_CHARS)
+    assert not plain.startswith("a" * (pfsense.LOG_VALUE_MAX_CHARS + 1))
+
+    newlines = pfsense.sanitize_for_log("\n" * 10000)
+    assert len(newlines) == bound
+    assert "\n" not in newlines
+    assert newlines.startswith("\\n")
+    assert newlines.endswith(pfsense.LOG_TRUNCATION_MARKER)
+
+
+# --- Log forgery: labels and API payloads are untrusted at every log site ------
+
+# The proof of concept from the 2026-08-01 review, confirmed by execution. It splits
+# into six NON-EMPTY labels, so it survives the label-count check and is rejected by
+# DNS_LABEL_PATTERN instead. The two rejection branches therefore need different
+# inputs — feeding this one to both makes the label-count test pass vacuously.
+FORGED_LABEL_FQDN = (
+    "a.b\n2026-08-01 21:00:00 - INFO - "
+    "Alias attacker.lab.internal added to host override parent.lab.internal"
+)
+FORGED_LABEL_FQDN_ESCAPED = (
+    "a.b\\n2026-08-01 21:00:00 - INFO - "
+    "Alias attacker.lab.internal added to host override parent.lab.internal"
+)
+
+# One label, no dot: this is what reaches the label-count rejection.
+FORGED_COUNT_FQDN = "a\n2026-08-02 12:00:00 - INFO - forged"
+FORGED_COUNT_FQDN_ESCAPED = "a\\n2026-08-02 12:00:00 - INFO - forged"
+
+
+def test_invalid_fqdn_warning_cannot_forge_a_log_record(caplog):
+    """The label-count rejection logs the value it just rejected; it must escape it."""
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        assert client.find_host_name(FORGED_COUNT_FQDN) is None
+
+    assert_no_forged_log_records(caplog)
+    rejected = [m for m in log_messages(caplog) if "Invalid FQDN" in m]
+    assert len(rejected) == 1
+    # The evidence survives: escaped, not stripped.
+    assert FORGED_COUNT_FQDN_ESCAPED in rejected[0]
+
+
+def test_invalid_fqdn_label_warning_cannot_forge_a_log_record(caplog):
+    """
+    The label-pattern rejection is where most hostile input actually lands.
+
+    It used to drop the value entirely — a lossy workaround for this very risk. With
+    escaping it can log the value again, which is what an operator needs to act.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.WARNING):
+        assert client.find_host_name(FORGED_LABEL_FQDN) is None
+
+    assert_no_forged_log_records(caplog)
+    rejected = [m for m in log_messages(caplog) if "Invalid FQDN" in m]
+    assert len(rejected) == 1
+    assert FORGED_LABEL_FQDN_ESCAPED in rejected[0]
+
+
+def test_host_override_not_found_warning_cannot_forge_a_log_record(caplog):
+    """Both mutators log the parent FQDN before anything has validated it."""
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: []
+    hostile_parent = "caddy.lab.internal\n2026-08-02 12:00:00 - INFO - forged"
+    escaped_parent = "caddy.lab.internal\\n2026-08-02 12:00:00 - INFO - forged"
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias(hostile_parent, "nginx.lab.internal") is False
+        assert client.del_host_override_alias(hostile_parent, "nginx.lab.internal") is False
+
+    assert_no_forged_log_records(caplog)
+    not_found = [m for m in log_messages(caplog) if "Host override" in m and "not found" in m]
+    assert len(not_found) == 2
+    for message in not_found:
+        assert escaped_parent in message
+
+
+def test_alias_not_found_warning_cannot_forge_a_log_record(caplog):
+    """The removal path logs the alias FQDN after _split_fqdn has already rejected it."""
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+    hostile_alias = "nginx\n2026-08-02 12:00:00 - INFO - forged.lab.internal"
+    escaped_alias = "nginx\\n2026-08-02 12:00:00 - INFO - forged.lab.internal"
+
+    with caplog.at_level(logging.WARNING):
+        assert client.del_host_override_alias("caddy.lab.internal", hostile_alias) is False
+
+    assert_no_forged_log_records(caplog)
+    missing = [m for m in log_messages(caplog) if "not found in host override" in m]
+    assert len(missing) == 1
+    assert escaped_alias in missing[0]
+
+
+def test_already_mapped_warning_escapes_api_supplied_values(caplog):
+    """
+    Second-order forgery: the values here come from the pfSense API response, not from
+    a container label, and API responses are untrusted input too.
+
+    Reaching this branch needs find_host_name to resolve via the ALIAS match, so the
+    override's own host/domain must not match while one of its aliases does.
+    """
+    hostile_host = "caddy\n2026-08-02 12:00:00 - INFO - forged"
+    hostile_domain = "lab.internal\r2026-08-02 12:00:00 - INFO - forged"
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": hostile_host,
+            "domain": hostile_domain,
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+            ],
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
+
+    assert_no_forged_log_records(caplog)
+    mapped = [m for m in log_messages(caplog) if "already mapped" in m]
+    assert len(mapped) == 1
+    assert "caddy\\n2026-08-02 12:00:00 - INFO - forged" in mapped[0]
+    assert "lab.internal\\r2026-08-02 12:00:00 - INFO - forged" in mapped[0]
+
+
+def test_already_mapped_warning_survives_an_override_without_host_keys(caplog):
+    """
+    find_host_name returns an override whenever one of its *aliases* matches, regardless
+    of that override's own keys, so indexing alias['host'] here raised KeyError straight
+    out of this module — past main()'s except clause and into sys.exit(1). API failures
+    log and return False; they never raise.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+            ],
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
+
+    assert "already mapped" in caplog.text
+
+
+def test_valid_fqdn_log_wording_is_unchanged(caplog):
+    """
+    Sanitizing a clean value must be the identity, wording included.
+
+    This is the defense against repr()/!r being reintroduced: quoting and reformatting
+    every FQDN would change what operators read for the overwhelmingly common case.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: []
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
+
+    assert "Host override caddy.lab.internal not found." in log_messages(caplog)
+
+
+def test_api_error_log_cannot_forge_a_log_record(monkeypatch, caplog):
+    """
+    A requests exception carries off-box string data, so this log site is not internal.
+
+    The HTTP reason phrase comes straight off the wire: http.client parses
+    `HTTP/1.1 500 Internal\\x1b[31mError\\x07` into r.reason verbatim, and that text
+    reaches the exception message. Anyone who can answer as the pfSense host — or sit
+    in front of it — can therefore fabricate a log record from an error path.
+    """
+    hostile = "upstream said: boom\n2026-08-02 12:00:00 - INFO - forged"
+    response = FakeResponse()
+    error = requests.HTTPError(hostile)
+    error.response = response
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.get", lambda **_kwargs: FakeResponse(error=error))
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert_no_forged_log_records(caplog)
+    failed = [m for m in log_messages(caplog) if "API call failed" in m]
+    assert len(failed) == 1
+    # We escape, we do not discard: the diagnostic text an operator needs survives.
+    assert "\\n" in failed[0]
+    assert "upstream said: boom" in failed[0]
+    assert "forged" in failed[0]
+    # The status code is an int from requests' own parser, not wire string data, so it
+    # is not sanitized and its wording is unchanged.
+    assert "HTTP Status Code: 500" in caplog.text
+
+
+# --- Sanitization is bounded, and applies to the log only ----------------------
+
+
+def test_a_long_but_valid_fqdn_is_truncated_in_the_log_but_not_in_the_payload(monkeypatch, caplog):
+    """
+    Sanitization is a *rendering* step. It must never reach the value passed onward.
+
+    DNS_LABEL_PATTERN bounds each label at 63 characters but not the label count, so an
+    FQDN can pass validation and still be kilobytes long. That makes this the one place
+    in the suite that can distinguish "escaped and truncated for the log" from "escaped
+    and truncated everywhere" — the second corrupts the pfSense API payload, writing an
+    alias whose name is not the name the operator asked for.
+    """
+    posts = []
+
+    def fake_post(url, headers, verify, timeout, json=None):
+        posts.append({"url": url, "json": json})
+        return FakeResponse()
+
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    # 40 labels of 60 characters: 2439 characters, every label valid.
+    long_fqdn = ".".join(["a" * 60] * 40)
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.INFO):
+        assert client.add_host_override_alias("caddy.lab.internal", long_fqdn) is True
+
+    added = [m for m in log_messages(caplog) if "added to host override" in m]
+    assert len(added) == 1
+    assert pfsense.LOG_TRUNCATION_MARKER in added[0]
+    assert len(added[0]) < pfsense.LOG_VALUE_MAX_CHARS + 200
+    assert long_fqdn not in added[0]
+    # The evidence survives: an operator can still see what was asked for.
+    assert "a" * 60 in added[0]
+
+    # The load-bearing assertion: the alias-creation payload is byte-for-byte the
+    # validated value, with no marker, no escape, and no truncation.
+    alias_post = posts[0]
+    assert alias_post["url"] == (
+        "https://pfsense.lab.internal/api/v2/services/dns_resolver/host_override/alias"
+    )
+    assert alias_post["json"] == {
+        "parent_id": "12",
+        "host": "a" * 60,
+        "domain": ".".join(["a" * 60] * 39),
+        "descr": "",
+    }
+    assert pfsense.LOG_TRUNCATION_MARKER not in alias_post["json"]["domain"]
+    assert "\\" not in alias_post["json"]["domain"]
+
+
+def test_already_mapped_warning_truncates_oversized_api_values(caplog):
+    """
+    All THREE values on this line are unbounded, and all three must be capped.
+
+    Two are API supplied; the third is the label-supplied alias_fqdn, which reaches this
+    line having passed _split_fqdn — validation bounds each label at 63 characters but
+    not the label count, so a 24,399-character all-valid FQDN is accepted by Docker
+    verbatim and, under --restart=always, writes ~24 KB of uncapped log per start.
+
+    Requiring three markers pins each value independently: the cap is per value, not per
+    message, and removing the call from any single half drops the count to 2. Capping
+    the whole message would make each value's rendering depend on its neighbours and
+    break the exact-wording guarantee pinned elsewhere.
+    """
+    # 40 valid labels of 60 characters; the alias branch of find_host_name resolves the
+    # parent, so the override's own oversized name lands on the line beside it.
+    long_alias = ".".join(["a" * 60] * 40)
+    alias_host = "a" * 60
+    alias_domain = ".".join(["a" * 60] * 39)
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "c" * 5000,
+            "domain": "d" * 5000,
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": alias_host, "domain": alias_domain}
+            ],
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        assert client.add_host_override_alias("caddy.lab.internal", long_alias) is False
+
+    assert_no_forged_log_records(caplog)
+    mapped = [m for m in log_messages(caplog) if "already mapped" in m]
+    assert len(mapped) == 1
+    assert mapped[0].count(pfsense.LOG_TRUNCATION_MARKER) == 3
+    assert len(mapped[0]) < 3 * pfsense.LOG_VALUE_MAX_CHARS + 200
+    assert long_alias not in mapped[0]
+    assert "c" * 5000 not in mapped[0]
+    assert "d" * 5000 not in mapped[0]
+    # The evidence survives for all three.
+    assert "a" * 60 in mapped[0]
+    assert "c" * 100 in mapped[0]
+    assert "d" * 100 in mapped[0]

@@ -23,7 +23,15 @@ It authenticates DNS changes on a firewall. It must never reach logs, error mess
 
 ### 3. Label-derived input
 
-`_split_fqdn` is the injection barrier. It requires at least two non-empty labels, each matching `DNS_LABEL_PATTERN`, and rejects whitespace, newlines, empty labels, and leading or trailing hyphens. Anything FQDN-derived that reaches an API payload without passing through it is a finding. Container labels are set by whoever can start a container on the host — treat them as untrusted.
+There are two injection barriers, for two different destinations, and a finding at either one is real.
+
+`_split_fqdn` is the barrier for **API payloads**. It requires at least two non-empty labels, each matching `DNS_LABEL_PATTERN`, and rejects whitespace, newlines, empty labels, and leading or trailing hyphens. Anything FQDN-derived that reaches an API payload without passing through it is a finding. Container labels are set by whoever can start a container on the host — treat them as untrusted.
+
+`sanitize_for_log()` (in `pfsense.py`) is the barrier for **logs**. A container label, a container name, an exception message, or an API-response-derived value logged without it is a finding: an unescaped newline in any of those forges a complete, syntactically valid log record, which is a genuine log-injection vulnerability against anyone reading or alerting on this service's logs. Check this by grep, not just by reading: `grep -n 'logger\.\(info\|warning\|error\|critical\)' pfsense.py main.py` and confirm every f-string or `%`-arg that carries an FQDN, container name, Docker API object, or exception object routes through `sanitize_for_log()` first. A log call that interpolates such a value directly — including one added inside a new branch that runs *before* `_split_fqdn` or `find_host_name` has had a chance to validate it — is a finding regardless of whether the same value happens to be validated by the time some other line runs. `AGENTS.md`'s logging-constraints section names the allowlist for what should *not* be wrapped, as three classes: values supplied by whoever configures and runs the service, values this service authored itself (code literals, numbers from its own arithmetic), and provable no-ops on values that already passed `_split_fqdn`. A site outside all three classes is a finding, not an assumption to extend.
+
+The one deliberate exception is `_handle_error`'s `exc_info=True` traceback: that must stay unsanitized and multi-line, and a "fix" that flattens it is itself a finding, not an improvement. That is safe only because no exception reaching `_handle_error` today carries container-supplied text. A new `_handle_error` call site — or a broadened `except` clause that now funnels a container- or label-derived exception into an existing one — is therefore a finding even though the message-line escaping is unaffected, because the traceback tail re-emits the exception text unescaped. Check every `_handle_error(e, ...)` call site's exception source, not just its message-line sanitization.
+
+Confirm the two barriers stay separate: sanitization must never be applied to the value on its way into `_split_fqdn` or into a request payload, since that would corrupt what pfSense actually stores instead of merely changing what an operator reads in a log.
 
 ### 4. The Docker socket
 

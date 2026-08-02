@@ -30,7 +30,7 @@ def _handle_error(error, context=""):
     :param error: The exception raised.
     :param context: Additional context about the function or operation.
     """
-    logger.error(f"Error in {context}: {error}", exc_info=True)
+    logger.error(f"Error in {context}: {pfsense.sanitize_for_log(error)}", exc_info=True)
 
 def get_env_var(var_name):
     """Fetch an environment variable and exit if it is not set."""
@@ -91,7 +91,7 @@ LAST_APPLY_AT = None
 try:
     client = docker.from_env()
 except docker.errors.DockerException as e:
-    logger.critical(f"Error initializing Docker client: {e}")
+    logger.critical(f"Error initializing Docker client: {pfsense.sanitize_for_log(e)}")
     sys.exit(1)
 
 def add_aliases_on_startup():
@@ -121,7 +121,8 @@ def add_aliases_on_startup():
 
         labeled += 1
         logger.info(
-            f"Staging alias '{alias_config['alias_fqdn']}' for container '{container.name}'"
+            f"Staging alias '{pfsense.sanitize_for_log(alias_config['alias_fqdn'])}' "
+            f"for container '{pfsense.sanitize_for_log(container.name)}'"
         )
         if NAMESERVER.add_host_override_alias(
             alias_config["host_override_fqdn"],
@@ -217,7 +218,7 @@ def handle_container_event(event):
     try:
         container = client.containers.get(container_id)
     except docker.errors.NotFound as e:
-        logger.warning(f"Container not found: {e}")
+        logger.warning(f"Container not found: {pfsense.sanitize_for_log(e)}")
         return
     except docker.errors.DockerException as e:
         _handle_error(e, "handle_container_event")
@@ -232,14 +233,14 @@ def handle_container_event(event):
     action, alias_config = alias_action
 
     if action == "add":
-        logger.info(f"Container '{container.name}' is starting...")
+        logger.info(f"Container '{pfsense.sanitize_for_log(container.name)}' is starting...")
         process_start_event(
             alias_config["host_override_fqdn"],
             alias_config["alias_fqdn"],
             alias_config["alias_descr"]
         )
     elif action == "remove":
-        logger.info(f"Container '{container.name}' is stopping...")
+        logger.info(f"Container '{pfsense.sanitize_for_log(container.name)}' is stopping...")
         process_stop_event(alias_config["host_override_fqdn"], alias_config["alias_fqdn"])
 
 def should_apply_immediately():
