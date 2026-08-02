@@ -1,6 +1,7 @@
 import importlib
 import logging
 import sys
+import time
 import types
 
 
@@ -17,12 +18,14 @@ class FakeDockerClient:
         self.containers = types.SimpleNamespace(get=self.get_container, list=lambda: [])
         self.container = None
         self.closed = False
+        self.event_windows = []
 
     def get_container(self, _container_id):
         return self.container
 
-    def events(self, decode=True):
+    def events(self, since=None, until=None, decode=True):
         assert decode is True
+        self.event_windows.append((since, until))
         return iter(())
 
     def close(self):
@@ -183,16 +186,20 @@ def test_handle_container_event_ignores_missing_container_id(monkeypatch, caplog
 
 
 def test_main_loop_ignores_malformed_events(monkeypatch):
-    main, fake_client = load_main(monkeypatch)
+    main, _fake_client = load_main(monkeypatch)
     handled_events = []
-    fake_client.events = lambda decode=True: iter(
-        [
-            {},
-            {"Type": "container"},
-            {"Type": "network", "Action": "start"},
-            {"Type": "container", "Action": "start"},
-            {"Type": "container", "Action": "die"},
-        ]
+    monkeypatch.setattr(
+        main,
+        "iter_events",
+        lambda: iter(
+            [
+                {},
+                {"Type": "container"},
+                {"Type": "network", "Action": "start"},
+                {"Type": "container", "Action": "start"},
+                {"Type": "container", "Action": "die"},
+            ]
+        ),
     )
     monkeypatch.setattr(main, "handle_container_event", handled_events.append)
 
@@ -204,14 +211,29 @@ def test_main_loop_ignores_malformed_events(monkeypatch):
     ]
 
 
-def test_main_loop_reraises_docker_event_errors(monkeypatch):
-    main, fake_client = load_main(monkeypatch)
+def test_main_loop_flushes_pending_changes_on_a_window_tick(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    flushes = []
+    monkeypatch.setattr(
+        main,
+        "iter_events",
+        lambda: iter([{"Type": "container", "Action": "start"}, None, None]),
+    )
+    monkeypatch.setattr(main, "handle_container_event", lambda _event: None)
+    monkeypatch.setattr(main, "flush_pending_changes", lambda: flushes.append("flush"))
 
-    def fail_events(decode=True):
-        assert decode is True
+    main.main()
+
+    assert flushes == ["flush", "flush"]
+
+
+def test_main_loop_reraises_docker_event_errors(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+
+    def fail_events():
         raise DockerException("event stream failed")
 
-    fake_client.events = fail_events
+    monkeypatch.setattr(main, "iter_events", fail_events)
 
     try:
         main.main()
@@ -535,20 +557,27 @@ def test_process_events_delegate_to_nameserver(monkeypatch):
     added = []
     removed = []
     main.NAMESERVER = types.SimpleNamespace(
-        add_host_override_alias=lambda host, alias, descr: added.append((host, alias, descr)),
-        del_host_override_alias=lambda host, alias: removed.append((host, alias)),
+        add_host_override_alias=lambda host, alias, descr, apply: added.append(
+            (host, alias, descr, apply)
+        )
+        or True,
+        del_host_override_alias=lambda host, alias, apply: removed.append((host, alias, apply))
+        or True,
     )
 
     main.process_start_event("caddy.lab.internal", "nginx.lab.internal", "nginx service")
     main.process_stop_event("caddy.lab.internal", "nginx.lab.internal")
 
-    assert added == [("caddy.lab.internal", "nginx.lab.internal", "nginx service")]
-    assert removed == [("caddy.lab.internal", "nginx.lab.internal")]
+    # The first change in a quiet period applies immediately; the second coalesces
+    # because an apply just happened.
+    assert added == [("caddy.lab.internal", "nginx.lab.internal", "nginx service", True)]
+    assert removed == [("caddy.lab.internal", "nginx.lab.internal", False)]
 
 
 def test_main_runs_startup_scan_only_when_enabled(monkeypatch):
     main, _fake_client = load_main(monkeypatch, add_on_startup="true")
     scanned = []
+    monkeypatch.setattr(main, "iter_events", lambda: iter(()))
     monkeypatch.setattr(main, "add_aliases_on_startup", lambda: scanned.append(True))
 
     main.main()
@@ -557,6 +586,7 @@ def test_main_runs_startup_scan_only_when_enabled(monkeypatch):
 
     main, _fake_client = load_main(monkeypatch)
     scanned = []
+    monkeypatch.setattr(main, "iter_events", lambda: iter(()))
     monkeypatch.setattr(main, "add_aliases_on_startup", lambda: scanned.append(True))
 
     main.main()
@@ -660,3 +690,276 @@ def test_startup_scan_reports_staged_aliases_when_the_apply_fails(monkeypatch, c
     assert applies == ["apply"]
     assert "2 alias(es) are staged" in caplog.text
     assert "next successful apply" in caplog.text
+
+
+# --- Coalescing: a burst costs one reload, a lone start stays fast -------------
+
+
+class RecordingNameserver:
+    """Counts applies, distinguishing immediate ones from coalesced flushes."""
+
+    def __init__(self, apply_result=True):
+        self.staged = []
+        self.immediate_applies = 0
+        self.flush_applies = 0
+        self.apply_result = apply_result
+
+    def add_host_override_alias(self, _host_override, alias, _descr, apply):
+        self.staged.append((alias, apply))
+        if apply:
+            self.immediate_applies += 1
+        return True
+
+    def del_host_override_alias(self, _host_override, alias, apply):
+        self.staged.append((alias, apply))
+        if apply:
+            self.immediate_applies += 1
+        return True
+
+    def apply_changes(self):
+        self.flush_applies += 1
+        return self.apply_result
+
+    @property
+    def total_applies(self):
+        return self.immediate_applies + self.flush_applies
+
+
+def test_a_lone_container_start_applies_immediately(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+
+    main.process_start_event("caddy.lab.internal", "svc.lab.internal", "svc")
+
+    assert nameserver.staged == [("svc.lab.internal", True)]
+    assert nameserver.immediate_applies == 1
+    assert main.PENDING_CHANGES == 0
+
+
+def test_a_burst_of_starts_costs_two_applies_not_twenty(monkeypatch):
+    """The regression this change exists for: a compose up must not reload per service."""
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+
+    for i in range(20):
+        main.process_start_event("caddy.lab.internal", f"svc{i}.lab.internal", "svc")
+
+    # The first applied on its own; the remaining 19 are staged and still pending.
+    assert nameserver.immediate_applies == 1
+    assert main.PENDING_CHANGES == 19
+    assert [apply for _alias, apply in nameserver.staged] == [True] + [False] * 19
+
+    # A window tick after the quiet period flushes all 19 in one apply.
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 0.0)
+    main.flush_pending_changes()
+
+    assert nameserver.flush_applies == 1
+    assert nameserver.total_applies == 2
+    assert main.PENDING_CHANGES == 0
+
+
+def test_pending_changes_are_not_flushed_before_the_quiet_period(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 3600.0)
+
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    main.process_start_event("caddy.lab.internal", "b.lab.internal", "b")
+    main.flush_pending_changes()
+
+    assert nameserver.flush_applies == 0
+    assert main.PENDING_CHANGES == 1
+
+
+def test_max_wait_forces_a_flush_when_events_keep_arriving(monkeypatch):
+    """Continuous churn under the quiet threshold must not starve the apply forever."""
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 0.0)
+
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    main.process_start_event("caddy.lab.internal", "b.lab.internal", "b")
+    main.flush_pending_changes()
+
+    assert nameserver.flush_applies == 1
+    assert main.PENDING_CHANGES == 0
+
+
+def test_flush_is_a_noop_when_nothing_is_pending(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+
+    main.flush_pending_changes()
+    main.flush_pending_changes(force=True)
+
+    assert nameserver.flush_applies == 0
+
+
+def test_shutdown_flushes_pending_changes(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 3600.0)
+
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    main.process_start_event("caddy.lab.internal", "b.lab.internal", "b")
+    assert main.PENDING_CHANGES == 1
+
+    try:
+        main.cleanup(15, None)
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("cleanup did not exit")
+
+    # Staged changes must not be abandoned on SIGTERM.
+    assert nameserver.flush_applies == 1
+    assert fake_client.closed is True
+
+
+def test_shutdown_before_nameserver_exists_does_not_crash(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    main.NAMESERVER = None
+
+    try:
+        main.cleanup(15, None)
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("cleanup did not exit")
+
+    assert fake_client.closed is True
+
+
+def test_failed_flush_reports_changes_remain_staged(monkeypatch, caplog):
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver(apply_result=False)
+    main.NAMESERVER = nameserver
+    # Stage under a long quiet window, then collapse it so the flush is due.
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    main.process_start_event("caddy.lab.internal", "b.lab.internal", "b")
+    assert main.PENDING_CHANGES == 1
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 0.0)
+
+    with caplog.at_level(logging.ERROR):
+        main.flush_pending_changes()
+
+    assert "staged in the pfSense configuration" in caplog.text
+    assert main.PENDING_CHANGES == 0
+
+
+def test_iter_events_yields_a_tick_after_each_window(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    windows = []
+
+    def fake_events(since=None, until=None, decode=True):
+        assert decode is True
+        windows.append((since, until))
+        return iter([{"Type": "container", "Action": "start", "n": len(windows)}])
+
+    fake_client.events = fake_events
+
+    events = main.iter_events()
+    collected = [next(events) for _ in range(4)]
+
+    assert collected[0]["n"] == 1
+    assert collected[1] is None
+    assert collected[2]["n"] == 2
+    assert collected[3] is None
+    # Windows must be contiguous so events between them are not dropped.
+    assert windows[1][0] == windows[0][1]
+
+
+# --- Coalescing configuration -------------------------------------------------
+
+
+def test_quiet_window_is_configurable(monkeypatch):
+    monkeypatch.setenv("APPLY_QUIET_SECONDS", "2.5")
+    monkeypatch.setenv("APPLY_MAX_WAIT_SECONDS", "30")
+    main, _fake_client = load_main(monkeypatch)
+
+    assert main.APPLY_QUIET_SECONDS == 2.5
+    assert main.APPLY_MAX_WAIT_SECONDS == 30.0
+
+
+def test_unusable_coalescing_config_falls_back_to_defaults(monkeypatch, caplog):
+    main, _fake_client = load_main(monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        assert main.get_positive_float_env("SOME_WINDOW", 10.0) == 10.0
+
+        monkeypatch.setenv("SOME_WINDOW", "not-a-number")
+        assert main.get_positive_float_env("SOME_WINDOW", 10.0) == 10.0
+
+        monkeypatch.setenv("SOME_WINDOW", "0")
+        assert main.get_positive_float_env("SOME_WINDOW", 10.0) == 10.0
+
+        monkeypatch.setenv("SOME_WINDOW", "-5")
+        assert main.get_positive_float_env("SOME_WINDOW", 10.0) == 10.0
+
+    assert "invalid" in caplog.text
+    assert "non-positive" in caplog.text
+
+
+def test_shutdown_survives_a_failing_flush(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+
+    def exploding_apply():
+        raise RuntimeError("apply blew up")
+
+    main.NAMESERVER = types.SimpleNamespace(apply_changes=exploding_apply)
+    monkeypatch.setattr(main, "PENDING_CHANGES", 1)
+    monkeypatch.setattr(main, "LAST_CHANGE_AT", 0.0)
+    monkeypatch.setattr(main, "PENDING_SINCE", 0.0)
+
+    with caplog.at_level(logging.ERROR):
+        try:
+            main.cleanup(15, None)
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            raise AssertionError("cleanup did not exit")
+
+    # A broken flush must not block shutdown or leave the client open.
+    assert "cleanup" in caplog.text
+    assert fake_client.closed is True
+
+
+def test_a_failed_add_stages_nothing(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    applies = []
+    main.NAMESERVER = types.SimpleNamespace(
+        add_host_override_alias=lambda *_args, **_kwargs: False,
+        del_host_override_alias=lambda *_args, **_kwargs: False,
+        apply_changes=lambda: applies.append("apply") or True,
+    )
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "LAST_APPLY_AT", time.monotonic())
+
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    main.process_stop_event("caddy.lab.internal", "b.lab.internal")
+
+    assert main.PENDING_CHANGES == 0
+    assert applies == []
+
+
+def test_a_coalesced_removal_is_staged_like_an_addition(monkeypatch):
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "LAST_APPLY_AT", time.monotonic())
+
+    main.process_stop_event("caddy.lab.internal", "gone.lab.internal")
+
+    assert nameserver.staged == [("gone.lab.internal", False)]
+    assert main.PENDING_CHANGES == 1
