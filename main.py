@@ -53,7 +53,13 @@ except docker.errors.DockerException as e:
     sys.exit(1)
 
 def add_aliases_on_startup():
-    """Scan all existing Docker containers and add their aliases if not already added."""
+    """
+    Scan all existing Docker containers and add their aliases if not already added.
+
+    Aliases are staged individually and applied once at the end. Applying per alias
+    reloads unbound every time, which takes seconds each and can drop updates when
+    reloads overlap.
+    """
     logger.info("Scanning existing Docker containers for aliases to add...")
     try:
         containers = client.containers.list()
@@ -61,7 +67,8 @@ def add_aliases_on_startup():
         _handle_error(e, "add_aliases_on_startup")
         return
 
-    found = False
+    labeled = 0
+    staged = 0
 
     for container in containers:
         labels = get_container_labels(container)
@@ -70,16 +77,34 @@ def add_aliases_on_startup():
         if not alias_config:
             continue
 
-        logger.info(f"Adding alias '{alias_config['alias_fqdn']}' for container '{container.name}'")
-        NAMESERVER.add_host_override_alias(
+        labeled += 1
+        logger.info(
+            f"Staging alias '{alias_config['alias_fqdn']}' for container '{container.name}'"
+        )
+        if NAMESERVER.add_host_override_alias(
             alias_config["host_override_fqdn"],
             alias_config["alias_fqdn"],
-            alias_config["alias_descr"]
-        )
-        found = True
+            alias_config["alias_descr"],
+            apply=False
+        ):
+            staged += 1
 
-    if not found:
+    if not labeled:
         logger.info("No aliases found during startup.")
+        return
+
+    if not staged:
+        logger.warning(
+            f"Found {labeled} labeled container(s) but staged no aliases; nothing to apply."
+        )
+        return
+
+    logger.info(f"Applying {staged} staged alias(es) in a single reload...")
+    if not NAMESERVER.apply_changes():
+        logger.error(
+            f"{staged} alias(es) are staged in the pfSense configuration but were not "
+            "applied. They will take effect on the next successful apply."
+        )
 
 def cleanup(_signum, _frame):
     """Cleanup actions to perform when the script exits."""

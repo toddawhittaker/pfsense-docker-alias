@@ -239,15 +239,19 @@ def test_add_aliases_on_startup_adds_labeled_running_containers(monkeypatch):
         ),
         types.SimpleNamespace(name="unlabeled", attrs={"Config": {"Labels": {}}}),
     ]
+    applies = []
     main.NAMESERVER = types.SimpleNamespace(
-        add_host_override_alias=lambda host_override, alias, description: calls.append(
-            (host_override, alias, description)
+        add_host_override_alias=lambda host_override, alias, description, apply: calls.append(
+            (host_override, alias, description, apply)
         )
+        or True,
+        apply_changes=lambda: applies.append("apply") or True,
     )
 
     main.add_aliases_on_startup()
 
-    assert calls == [("caddy.lab.internal", "nginx.lab.internal", "nginx service")]
+    assert calls == [("caddy.lab.internal", "nginx.lab.internal", "nginx service", False)]
+    assert applies == ["apply"]
 
 
 def test_handle_container_event_dispatches_stop_when_enabled(monkeypatch):
@@ -558,3 +562,101 @@ def test_main_runs_startup_scan_only_when_enabled(monkeypatch):
     main.main()
 
     assert scanned == []
+
+
+# --- Startup batching: one reload, not one per alias --------------------------
+
+
+def _labeled_container(name, alias):
+    return types.SimpleNamespace(
+        name=name,
+        attrs={
+            "Config": {
+                "Labels": {
+                    "pfsense.dns.override": "caddy.lab.internal",
+                    "pfsense.dns.alias": alias,
+                    "pfsense.dns.description": f"{name} service",
+                }
+            }
+        },
+    )
+
+
+def _recording_nameserver(staged, applies, add_result=True, apply_result=True):
+    return types.SimpleNamespace(
+        add_host_override_alias=lambda host_override, alias, description, apply: (
+            staged.append((alias, apply)) or add_result
+        ),
+        apply_changes=lambda: applies.append("apply") or apply_result,
+    )
+
+
+def test_startup_scan_applies_once_for_many_aliases(monkeypatch):
+    """The regression this change exists for: N aliases must cost one reload, not N."""
+    main, fake_client = load_main(monkeypatch)
+    staged = []
+    applies = []
+    fake_client.containers.list = lambda: [
+        _labeled_container(f"svc{i}", f"svc{i}.lab.internal") for i in range(20)
+    ]
+    main.NAMESERVER = _recording_nameserver(staged, applies)
+
+    main.add_aliases_on_startup()
+
+    assert len(staged) == 20
+    assert all(apply is False for _alias, apply in staged)
+    assert applies == ["apply"]
+
+
+def test_startup_scan_does_not_apply_when_nothing_was_staged(monkeypatch):
+    main, fake_client = load_main(monkeypatch)
+    staged = []
+    applies = []
+    fake_client.containers.list = lambda: [
+        types.SimpleNamespace(name="plain", attrs={"Config": {"Labels": {}}})
+    ]
+    main.NAMESERVER = _recording_nameserver(staged, applies)
+
+    main.add_aliases_on_startup()
+
+    assert staged == []
+    assert applies == []
+
+
+def test_startup_scan_does_not_apply_when_every_stage_failed(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+    staged = []
+    applies = []
+    fake_client.containers.list = lambda: [
+        _labeled_container("svc0", "svc0.lab.internal"),
+        _labeled_container("svc1", "svc1.lab.internal"),
+    ]
+    main.NAMESERVER = _recording_nameserver(staged, applies, add_result=False)
+
+    with caplog.at_level(logging.WARNING):
+        main.add_aliases_on_startup()
+
+    assert len(staged) == 2
+    assert applies == []
+    # Labeled-but-unstaged must not be reported as "no aliases found" — that
+    # hid a real failure while looking like an idle startup.
+    assert "Found 2 labeled container(s)" in caplog.text
+    assert "No aliases found during startup" not in caplog.text
+
+
+def test_startup_scan_reports_staged_aliases_when_the_apply_fails(monkeypatch, caplog):
+    main, fake_client = load_main(monkeypatch)
+    staged = []
+    applies = []
+    fake_client.containers.list = lambda: [
+        _labeled_container("svc0", "svc0.lab.internal"),
+        _labeled_container("svc1", "svc1.lab.internal"),
+    ]
+    main.NAMESERVER = _recording_nameserver(staged, applies, apply_result=False)
+
+    with caplog.at_level(logging.ERROR):
+        main.add_aliases_on_startup()
+
+    assert applies == ["apply"]
+    assert "2 alias(es) are staged" in caplog.text
+    assert "next successful apply" in caplog.text

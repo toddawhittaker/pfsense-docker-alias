@@ -1,6 +1,7 @@
 import requests
 import logging
 
+import pfsense
 from pfsense import PFSense
 
 
@@ -24,6 +25,11 @@ def http_error():
     error = requests.HTTPError("request failed")
     error.response = response
     return error
+
+
+def applied_status_get(applied=True):
+    """A requests.get stand-in for the apply endpoint's status poll."""
+    return lambda **_kwargs: FakeResponse({"data": {"applied": applied}})
 
 
 def test_get_all_host_overrides_constructs_request(monkeypatch):
@@ -178,6 +184,7 @@ def test_add_host_override_alias_constructs_alias_and_apply_requests(monkeypatch
         return FakeResponse()
 
     monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
 
     client = PFSense("pfsense.lab.internal", "secret-token", verify_ssl=False)
     client.get_all_host_overrides = lambda: [
@@ -221,6 +228,61 @@ def test_add_host_override_alias_constructs_alias_and_apply_requests(monkeypatch
             "json": None,
         },
     ]
+
+
+def test_add_host_override_alias_can_stage_without_applying(monkeypatch):
+    posts = []
+    gets = []
+
+    monkeypatch.setattr(
+        "pfsense.requests.post",
+        lambda url, **_kwargs: posts.append(url) or FakeResponse(),
+    )
+    monkeypatch.setattr(
+        "pfsense.requests.get",
+        lambda url, **_kwargs: gets.append(url) or FakeResponse(),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    assert client.add_host_override_alias(
+        "caddy.lab.internal", "nginx.lab.internal", "nginx service", apply=False
+    )
+
+    assert posts == [
+        "https://pfsense.lab.internal/api/v2/services/dns_resolver/host_override/alias"
+    ]
+    assert gets == []
+
+
+def test_del_host_override_alias_can_stage_without_applying(monkeypatch):
+    posts = []
+
+    monkeypatch.setattr("pfsense.requests.delete", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "pfsense.requests.post",
+        lambda url, **_kwargs: posts.append(url) or FakeResponse(),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [
+                {"id": 34, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+            ],
+        }
+    ]
+
+    assert client.del_host_override_alias(
+        "caddy.lab.internal", "nginx.lab.internal", apply=False
+    )
+    assert posts == []
 
 
 def test_add_host_override_alias_returns_false_when_api_post_fails(monkeypatch):
@@ -330,6 +392,7 @@ def test_del_host_override_alias_constructs_delete_and_apply_requests(monkeypatc
 
     monkeypatch.setattr("pfsense.requests.delete", fake_delete)
     monkeypatch.setattr("pfsense.requests.post", fake_post)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
 
     client = PFSense("pfsense.lab.internal", "secret-token", verify_ssl=False)
     client.get_all_host_overrides = lambda: [
@@ -590,3 +653,105 @@ def test_del_host_override_alias_returns_false_when_delete_exhausts_retries(monk
 
     assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
     assert calls == ["delete", "delete", "delete"]
+
+
+def test_apply_changes_confirms_the_reload_landed(monkeypatch):
+    posts = []
+    gets = []
+
+    monkeypatch.setattr(
+        "pfsense.requests.post",
+        lambda url, **_kwargs: posts.append(url) or FakeResponse(),
+    )
+    monkeypatch.setattr(
+        "pfsense.requests.get",
+        lambda url, **_kwargs: gets.append(url) or FakeResponse({"data": {"applied": True}}),
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.apply_changes() is True
+    assert posts == ["https://pfsense.lab.internal/api/v2/services/dns_resolver/apply"]
+    assert gets == ["https://pfsense.lab.internal/api/v2/services/dns_resolver/apply"]
+
+
+def test_apply_changes_polls_until_pfsense_reports_applied(monkeypatch):
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+
+    polls = []
+
+    def slow_apply(**_kwargs):
+        polls.append("get")
+        return FakeResponse({"data": {"applied": len(polls) >= 3}})
+
+    monkeypatch.setattr("pfsense.requests.get", slow_apply)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.apply_changes() is True
+    assert len(polls) == 3
+
+
+def test_apply_changes_gives_up_and_reports_changes_still_staged(monkeypatch, caplog):
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(applied=False))
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.apply_changes() is False
+
+    assert "remain staged" in caplog.text
+
+
+def test_apply_changes_returns_false_when_the_apply_post_fails(monkeypatch):
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "pfsense.requests.post",
+        lambda **_kwargs: FakeResponse(error=http_error()),
+    )
+    gets = []
+    monkeypatch.setattr(
+        "pfsense.requests.get", lambda **_kwargs: gets.append("get") or FakeResponse()
+    )
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.apply_changes() is False
+    assert gets == []
+
+
+def test_apply_changes_status_poll_does_not_multiply_the_retry_budget(monkeypatch):
+    """A failing status poll must not stack _request retries inside the poll loop."""
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+
+    attempts = []
+
+    def unreachable(**_kwargs):
+        attempts.append("get")
+        raise requests.ConnectionError("unreachable")
+
+    monkeypatch.setattr("pfsense.requests.get", unreachable)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.apply_changes() is False
+    assert len(attempts) == pfsense.APPLY_POLL_ATTEMPTS
+
+
+def test_apply_changes_treats_a_malformed_status_body_as_not_applied(monkeypatch):
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+
+    class InvalidJson(FakeResponse):
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setattr("pfsense.requests.get", lambda **_kwargs: InvalidJson())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client.apply_changes() is False

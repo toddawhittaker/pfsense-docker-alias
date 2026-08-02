@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 
 API_REQUEST_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
+# Applying is asynchronous: the POST returns before unbound has finished
+# reloading, so confirm with a bounded GET poll rather than fire-and-forget.
+APPLY_POLL_ATTEMPTS = 15
+APPLY_POLL_DELAY_SECONDS = 1
 DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 class PFSense:
@@ -94,13 +98,18 @@ class PFSense:
 
         return labels[0], '.'.join(labels[1:])
 
-    def _request(self, method, context, **kwargs):
-        """Run a pfSense API request with a small retry budget for transient failures."""
-        for attempt in range(1, API_REQUEST_ATTEMPTS + 1):
+    def _request(self, method, context, attempts=API_REQUEST_ATTEMPTS, **kwargs):
+        """
+        Run a pfSense API request with a small retry budget for transient failures.
+
+        :param attempts: How many times to try. Callers that already poll pass 1, so a
+            retry budget is not multiplied by a poll budget into a long stall.
+        """
+        for attempt in range(1, attempts + 1):
             try:
                 return method(**kwargs)
             except requests.RequestException as e:
-                if attempt == API_REQUEST_ATTEMPTS:
+                if attempt == attempts:
                     self._handle_api_error(e, context)
                     return None
 
@@ -108,11 +117,84 @@ class PFSense:
                     "API call failed during '%s' attempt %s/%s; retrying.",
                     context,
                     attempt,
-                    API_REQUEST_ATTEMPTS
+                    attempts
                 )
                 time.sleep(API_RETRY_DELAY_SECONDS)
 
         return None
+
+    def _headers(self):
+        """Return the authentication headers for a pfSense API request."""
+        return {
+            'X-API-Key': f"{self.pfsense_api_key}",
+            'Content-Type': 'application/json'
+        }
+
+    def apply_changes(self):
+        """
+        Applies staged DNS resolver changes and waits for the reload to finish.
+
+        pfSense applies changes asynchronously, so the POST returns before unbound has
+        reloaded. Poll the apply endpoint until it reports the change as applied rather
+        than assuming success, because an unconfirmed reload is indistinguishable from a
+        lost update.
+
+        :return: True if the changes were confirmed applied, False otherwise
+        """
+        headers = self._headers()
+        url = f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply'
+
+        try:
+            response = self._request(
+                requests.post,
+                "apply_changes",
+                url=url,
+                headers=headers,
+                verify=self.verify_ssl,
+                timeout=10
+            )
+            if response is None:
+                return False
+            response.raise_for_status()
+        except requests.RequestException as e:
+            self._handle_api_error(e, "apply_changes")
+            return False
+
+        for attempt in range(1, APPLY_POLL_ATTEMPTS + 1):
+            if self._changes_applied():
+                logger.info("DNS resolver changes applied.")
+                return True
+
+            if attempt < APPLY_POLL_ATTEMPTS:
+                time.sleep(APPLY_POLL_DELAY_SECONDS)
+
+        logger.error(
+            "DNS resolver changes were not confirmed applied after %s attempts. "
+            "They remain staged in the pfSense configuration.",
+            APPLY_POLL_ATTEMPTS
+        )
+        return False
+
+    def _changes_applied(self):
+        """Return True when pfSense reports the staged DNS resolver changes as applied."""
+        try:
+            response = self._request(
+                requests.get,
+                "apply_changes_status",
+                attempts=1,
+                url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
+                headers=self._headers(),
+                verify=self.verify_ssl,
+                timeout=10
+            )
+            if response is None:
+                return False
+            response.raise_for_status()
+            data = response.json().get('data', {})
+            return bool(data.get('applied'))
+        except (requests.RequestException, ValueError, AttributeError) as e:
+            self._handle_api_error(e, "apply_changes_status")
+            return False
 
     def _handle_api_error(self, error, context=""):
         """
@@ -192,15 +274,19 @@ class PFSense:
             )
         return alias
 
-    def add_host_override_alias(self, host_override_fqdn, alias_fqdn, alias_descr=""):
-        # pylint: disable=too-many-return-statements
+    def add_host_override_alias(self, host_override_fqdn, alias_fqdn, alias_descr="", apply=True):
+        # pylint: disable=too-many-return-statements,redefined-builtin
         """
         Adds an alias to an existing host override in pfSense.
 
         :param host_override_fqdn: The fully qualified domain name of the existing host override.
         :param alias_fqdn: The fully qualified domain name of the alias to add.
         :param alias_descr: Description for the alias (optional).
-        :return: True if the alias was added, False otherwise
+        :param apply: Apply the change immediately. Pass False when staging several aliases,
+            then call apply_changes() once for the batch — each apply reloads unbound and
+            takes seconds, so applying per alias is both slow and a source of lost updates.
+        :return: True if the alias was added, False otherwise. With apply=False, True means
+            the alias is staged in the pfSense configuration but not yet live.
         """
         split_fqdn = self._split_fqdn(alias_fqdn, "add_host_override_alias")
         if not split_fqdn:
@@ -220,12 +306,6 @@ class PFSense:
             logger.warning(f"Host override {host_override_fqdn} not found.")
             return False
 
-        # Define the headers for authentication
-        headers = {
-            'X-API-Key': f"{self.pfsense_api_key}",
-            'Content-Type': 'application/json'
-        }
-
         data = {
             'parent_id': f'{host_override["id"]}',
             'host': f'{alias_host}',
@@ -238,7 +318,7 @@ class PFSense:
                 requests.post,
                 "add_host_override_alias",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
-                headers=headers,
+                headers=self._headers(),
                 verify=self.verify_ssl,
                 timeout=10,
                 json=data
@@ -247,32 +327,27 @@ class PFSense:
                 return False
             response.raise_for_status()
 
-            # Apply changes
-            response = self._request(
-                requests.post,
-                "add_host_override_alias_apply",
-                url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
-                headers=headers,
-                verify=self.verify_ssl,
-                timeout=10
-            )
-            if response is None:
-                return False
-            response.raise_for_status()
-            logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
-            return True
-
         except requests.RequestException as e:
             self._handle_api_error(e, "add_host_override_alias")
             return False
 
-    def del_host_override_alias(self, host_override_fqdn, alias_fqdn):
+        if apply and not self.apply_changes():
+            return False
+
+        logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
+        return True
+
+    def del_host_override_alias(self, host_override_fqdn, alias_fqdn, apply=True):
+        # pylint: disable=redefined-builtin
         """
         Removes an alias from an existing host override in pfSense.
 
         :param host_override_fqdn: The fully qualified domain name of the existing host override.
         :param alias_fqdn: The fully qualified domain name of the alias to remove.
-        :return: True if the alias was removed, False otherwise
+        :param apply: Apply the change immediately. Pass False when staging several removals,
+            then call apply_changes() once for the batch.
+        :return: True if the alias was removed, False otherwise. With apply=False, True means
+            the removal is staged in the pfSense configuration but not yet live.
         """
         host_override = self.find_host_name(host_override_fqdn)
         if not host_override:
@@ -283,11 +358,6 @@ class PFSense:
         if not alias:
             logger.warning(f"Alias {alias_fqdn} not found in host override {host_override_fqdn}.")
             return False
-
-        headers = {
-            'X-API-Key': f"{self.pfsense_api_key}",
-            'Content-Type': 'application/json'
-        }
 
         data = {
             'parent_id': f'{alias["parent_id"]}',
@@ -300,7 +370,7 @@ class PFSense:
                 requests.delete,
                 "del_host_override_alias",
                 url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
-                headers=headers,
+                headers=self._headers(),
                 verify=self.verify_ssl,
                 timeout=10,
                 json=data
@@ -309,21 +379,12 @@ class PFSense:
                 return False
             response.raise_for_status()
 
-            # Apply changes
-            response = self._request(
-                requests.post,
-                "del_host_override_alias_apply",
-                url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/apply',
-                headers=headers,
-                verify=self.verify_ssl,
-                timeout=10
-            )
-            if response is None:
-                return False
-            response.raise_for_status()
-            logger.info(f"Alias {alias_fqdn} removed from host override {host_override_fqdn}.")
-            return True
-
         except requests.RequestException as e:
             self._handle_api_error(e, "del_host_override_alias")
             return False
+
+        if apply and not self.apply_changes():
+            return False
+
+        logger.info(f"Alias {alias_fqdn} removed from host override {host_override_fqdn}.")
+        return True
