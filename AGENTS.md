@@ -18,7 +18,7 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (93 tests)
+.venv/bin/python -m pytest                          # full suite (117 tests)
 .venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
@@ -86,6 +86,8 @@ Deliberately asymmetric — keep it that way:
 
 Applying is the expensive part: it reloads unbound, takes seconds, and **runs asynchronously** — the POST returns before the reload finishes. `apply_changes()` therefore polls `GET /dns_resolver/apply` until the response reports `applied`, up to `APPLY_POLL_ATTEMPTS`, and returns `False` with an error if it never confirms. Treat an unconfirmed reload as a possible lost update, not a success.
 
+Confirmation is `data.get('applied') is True` — not `bool(...)`, not `== True`. It fails closed on every other encoding, including the strings `"false"` and `"true"` and the integer `1`; `bool("false")` and `1 == True` are both truthy, and either would let a hostile or buggy response report a reload as applied when it was not. `data` being a non-dict needs no separate guard: `response.json().get('data', {})` and `data.get('applied')` both raise `AttributeError` for a malformed body, and `AttributeError` is already in `_changes_applied`'s except tuple.
+
 That status poll passes `attempts=1` to `_request`. Do not let it use the default retry budget — a retry budget nested inside a poll budget multiplies into a stall long enough to block the event loop.
 
 **Never apply once per item in a loop.** `add_aliases_on_startup` stages every alias with `apply=False` and calls `apply_changes()` exactly once at the end, skipping it entirely when nothing staged. Applying per alias meant 20 containers cost 20 unbound reloads and ~40s of DNS disruption, with overlapping async reloads a likely cause of dropped updates. `tests/test_main.py::test_startup_scan_applies_once_for_many_aliases` pins this by counting.
@@ -125,6 +127,8 @@ For the same reason, **a failed flush keeps its changes pending**. `flush_pendin
 
 `add_host_override_alias` first calls `find_host_name(alias_fqdn)` to reject an alias already used as a host override or alias anywhere, then resolves the parent host override — the override must already exist in pfSense; this service never creates one.
 
+Response-derived values are escaped with `sanitize_for_log()` before they reach a log call, same as any other externally supplied value — an API response is untrusted input for logging purposes just as much as for payload shape. The "already mapped to" warning reads the matched override's `host`/`domain` with `.get()`, not indexing: `find_host_name` returns a host override whenever one of its *aliases* matches, regardless of that override's own keys, so an override missing `host`/`domain` used to raise `KeyError` straight out of this module.
+
 ### Configuration parsing quirks
 
 - `PFSENSE_VERIFY_SSL` is true unless it lowercases to exactly `"false"` (fail-secure). `ADD_ALIASES_ON_STARTUP` is false unless it lowercases to `"true"`.
@@ -134,7 +138,30 @@ For the same reason, **a failed flush keeps its changes pending**. `flush_pendin
 
 ### Validation and logging constraints
 
-`_split_fqdn` requires ≥2 non-empty labels each matching `DNS_LABEL_PATTERN`; it is the injection barrier between container labels and API payloads. Route new FQDN-derived input through it.
+There are two injection barriers, not one, and they guard different things:
+
+- `_split_fqdn` requires ≥2 non-empty labels each matching `DNS_LABEL_PATTERN`; it is the barrier between container labels and API **payloads**. Route new FQDN-derived input through it before it reaches a request body.
+- `sanitize_for_log()` (in `pfsense.py`, next to `DNS_LABEL_PATTERN`) is the barrier for **logs**. Every log call that interpolates an FQDN, a container name, an exception message, or any other externally supplied or API-derived value routes through it, with no "already validated" carve-out. Both barriers are needed together because the rejection branches — `_split_fqdn`'s own warnings, "Host override not found", "Alias not found" — log the very value they just rejected, before or without validation ever having run on it.
+
+`sanitize_for_log()` escapes every non-printable character (`\n`, `\r`, `\t`, control characters, the U+2028/U+2029 line separators, and a literal backslash so the mapping stays injective) so a hostile value cannot fabricate a log record, then truncates to `LOG_VALUE_MAX_CHARS` (512) with `LOG_TRUNCATION_MARKER`. Escape before truncating, not the reverse — truncating a long run of control characters first would let it expand several-fold on escaping. The cap is **per value, not per message**: a message that interpolates two sanitized values is bounded at roughly `2 * LOG_VALUE_MAX_CHARS`, not at `LOG_VALUE_MAX_CHARS` overall. Capping the whole message would make one value's rendering depend on its neighbours and would break the exact-wording guarantee below. On any printable-ASCII value under 512 characters — every value in every test written before this barrier existed — the function is the identity, which is why no existing log-wording assertion moved when it was introduced; `test_valid_fqdn_log_wording_is_unchanged` pins that a clean FQDN renders unchanged, guarding against `repr()`/`!r` quoting being reintroduced later.
+
+Sanitization applies to the **log call only**. It must never touch the value passed to `_split_fqdn` or written into an API payload — doing so would silently corrupt the alias pfSense actually creates.
+
+**The trust-boundary rule, stated so it needs no judgment to apply:** sanitize every value that crosses a trust boundary into a log — container labels, container names, Docker API objects, pfSense API responses, and the exception strings derived from either. Do not sanitize values supplied by whoever configures and runs the service; that actor already owns the process, so escaping defends against nobody.
+
+**Exclusions.** The mandated grep hits these; they are intended.
+
+- **Values supplied by whoever configures and runs the service** — `get_positive_float_env`'s two "Ignoring…" warnings, the `PFSENSE_CA_BUNDLE` "is not readable" critical, and `PFSense.__init__`'s "pfSense host set to". That actor already owns the process, so escaping defends against nobody.
+- **Values this service authored** — code literals such as `get_env_var`'s variable name; numbers from our own arithmetic such as `_handle_api_error`'s HTTP status code and `flush_pending_changes`'s coalesced count and reason.
+- **The provable no-ops** described below.
+
+Anything outside these three classes is a finding.
+
+Any `sanitize_for_log` call on a value that has already passed `_split_fqdn` is a provable no-op today and cannot be pinned by a test. They exist so that a future edit which moves a log line above its validation — the exact shape of the log-forgery finding — is harmless by construction. Do not remove them as dead code.
+
+**The `exc_info` assumption, made visible rather than fixed.** `_handle_error` logs with `exc_info=True`, and the formatter re-emits the exception text in the traceback tail **unescaped**. The escape on the message line does not cover it. That is safe only while no exception reaching `_handle_error` carries container-supplied text — today none does; `docker.errors.NotFound` is logged as a warning without `exc_info`. Wrapping label parsing or event handling in a broad `except` that funnels into `_handle_error` re-opens the log-forgery finding, or adding a new `_handle_error` call site whose exception can carry container-supplied text. Do not flatten the traceback to fix this; the traceback is the diagnostic, and `test_handle_error_escapes_the_message_but_keeps_the_traceback` pins that it stays multi-line and unescaped while the message line is escaped.
+
+`test_handle_error_escapes_the_message_but_keeps_the_traceback` asserts through `record.getMessage()`, which structurally excludes `exc_info`. The property that makes that test correct also means a green suite is not evidence the traceback is clean. This finding is defended by review, not by test.
 
 Never log API tokens, secrets, full authorization headers, sensitive environment values, or API response bodies. `_handle_api_error` logs the exception and status code but not `response.text`, and `test_http_error_logs_status_without_response_body` enforces it.
 
