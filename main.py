@@ -62,6 +62,15 @@ PFSENSE_HOSTNAME = get_env_var("PFSENSE_HOSTNAME")
 PFSENSE_API_TOKEN = get_env_var("PFSENSE_API_TOKEN")
 PFSENSE_VERIFY_SSL = os.getenv("PFSENSE_VERIFY_SSL", "true").lower() != "false"
 PFSENSE_CA_BUNDLE = os.getenv("PFSENSE_CA_BUNDLE")
+if PFSENSE_CA_BUNDLE and not os.access(PFSENSE_CA_BUNDLE, os.R_OK):
+    # Fail loudly at startup rather than on every request. An unreadable bundle used to
+    # surface as an opaque crash loop, which nudged operators toward disabling TLS
+    # verification instead of fixing the mount.
+    logger.critical(
+        f"PFSENSE_CA_BUNDLE '{PFSENSE_CA_BUNDLE}' is not readable. "
+        "Check that the CA bundle is mounted into the container at that path."
+    )
+    sys.exit(1)
 ADD_ALIASES_ON_STARTUP = os.getenv("ADD_ALIASES_ON_STARTUP", "false").lower() == "true"
 # Coalescing: a burst of container events (a compose up) should cost one reload, not
 # one per container. The first change in a quiet period still applies immediately so a
@@ -261,6 +270,12 @@ def _record_applied():
     LAST_CHANGE_AT = None
     LAST_APPLY_AT = time.monotonic()
 
+def _defer_retry():
+    """Push the next flush attempt out a full quiet window after a failed apply."""
+    global PENDING_SINCE, LAST_CHANGE_AT  # pylint: disable=global-statement
+    LAST_CHANGE_AT = time.monotonic()
+    PENDING_SINCE = LAST_CHANGE_AT
+
 def _flush_reason(force):
     """Describe why a flush is due, or None when it is not yet time."""
     if force:
@@ -285,38 +300,48 @@ def flush_pending_changes(force=False):
 
     count = PENDING_CHANGES
     logger.info(f"Applying {count} coalesced change(s) after {reason}...")
-    applied = NAMESERVER.apply_changes()
-    _record_applied()
+    if NAMESERVER.apply_changes():
+        _record_applied()
+        return
 
-    if not applied:
-        logger.error(
-            f"{count} change(s) are staged in the pfSense configuration but were not "
-            "applied. They will take effect on the next successful apply."
-        )
+    # Keep the changes pending so a later tick or the shutdown flush retries them —
+    # clearing the count here discarded them permanently. Push the next attempt out by
+    # a full quiet window so a pfSense outage is not retried on every window tick.
+    _defer_retry()
+    logger.error(
+        f"{count} change(s) remain staged in the pfSense configuration and are not live. "
+        "Retrying after the quiet period."
+    )
+
+def _record_change_outcome(succeeded):
+    """
+    Update coalescing state from what pfSense actually holds, not from the return value
+    alone.
+
+    A mutation can land in the configuration while its apply fails, which returns False
+    even though something is now staged. Trusting the boolean stranded those changes:
+    nothing was pending, so nothing ever retried the apply and the alias never went live.
+    """
+    if NAMESERVER.unapplied_changes:
+        _record_staged()
+    elif succeeded:
+        _record_applied()
 
 def process_start_event(host_override_fqdn, alias_fqdn, alias_descr):
     """Process a container start event and add an alias if necessary."""
     immediate = should_apply_immediately()
-    if not NAMESERVER.add_host_override_alias(
-        host_override_fqdn, alias_fqdn, alias_descr, apply=immediate
-    ):
-        return
-
-    if immediate:
-        _record_applied()
-    else:
-        _record_staged()
+    _record_change_outcome(
+        NAMESERVER.add_host_override_alias(
+            host_override_fqdn, alias_fqdn, alias_descr, apply=immediate
+        )
+    )
 
 def process_stop_event(host_override_fqdn, alias_fqdn):
     """Process a container stop event and remove an alias if necessary."""
     immediate = should_apply_immediately()
-    if not NAMESERVER.del_host_override_alias(host_override_fqdn, alias_fqdn, apply=immediate):
-        return
-
-    if immediate:
-        _record_applied()
-    else:
-        _record_staged()
+    _record_change_outcome(
+        NAMESERVER.del_host_override_alias(host_override_fqdn, alias_fqdn, apply=immediate)
+    )
 
 NAMESERVER = None
 

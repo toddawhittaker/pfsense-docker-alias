@@ -557,6 +557,7 @@ def test_process_events_delegate_to_nameserver(monkeypatch):
     added = []
     removed = []
     main.NAMESERVER = types.SimpleNamespace(
+        unapplied_changes=False,
         add_host_override_alias=lambda host, alias, descr, apply: added.append(
             (host, alias, descr, apply)
         )
@@ -613,12 +614,21 @@ def _labeled_container(name, alias):
 
 
 def _recording_nameserver(staged, applies, add_result=True, apply_result=True):
-    return types.SimpleNamespace(
-        add_host_override_alias=lambda host_override, alias, description, apply: (
-            staged.append((alias, apply)) or add_result
-        ),
-        apply_changes=lambda: applies.append("apply") or apply_result,
-    )
+    nameserver = RecordingNameserver(apply_result=apply_result, mutation_result=add_result)
+    real_add = nameserver.add_host_override_alias
+    real_apply = nameserver.apply_changes
+
+    def add(host_override, alias, description, apply):
+        staged.append((alias, apply))
+        return real_add(host_override, alias, description, apply)
+
+    def apply_changes():
+        applies.append("apply")
+        return real_apply()
+
+    nameserver.add_host_override_alias = add
+    nameserver.apply_changes = apply_changes
+    return nameserver
 
 
 def test_startup_scan_applies_once_for_many_aliases(monkeypatch):
@@ -696,29 +706,50 @@ def test_startup_scan_reports_staged_aliases_when_the_apply_fails(monkeypatch, c
 
 
 class RecordingNameserver:
-    """Counts applies, distinguishing immediate ones from coalesced flushes."""
+    """
+    Counts applies, distinguishing immediate ones from coalesced flushes.
 
-    def __init__(self, apply_result=True):
+    Mirrors the real PFSense contract: a mutation that lands sets unapplied_changes,
+    and only a confirmed apply clears it. Modelling that is what lets these tests catch
+    a change that stages successfully but fails to apply.
+    """
+
+    def __init__(self, apply_result=True, mutation_result=True):
         self.staged = []
         self.immediate_applies = 0
         self.flush_applies = 0
         self.apply_result = apply_result
+        self.mutation_result = mutation_result
+        self.unapplied_changes = False
+
+    def _mutate(self, alias, apply):
+        self.staged.append((alias, apply))
+        if not self.mutation_result:
+            return False
+
+        self.unapplied_changes = True
+        if not apply:
+            return True
+
+        self.immediate_applies += 1
+        if not self.apply_result:
+            return False
+
+        self.unapplied_changes = False
+        return True
 
     def add_host_override_alias(self, _host_override, alias, _descr, apply):
-        self.staged.append((alias, apply))
-        if apply:
-            self.immediate_applies += 1
-        return True
+        return self._mutate(alias, apply)
 
     def del_host_override_alias(self, _host_override, alias, apply):
-        self.staged.append((alias, apply))
-        if apply:
-            self.immediate_applies += 1
-        return True
+        return self._mutate(alias, apply)
 
     def apply_changes(self):
         self.flush_applies += 1
-        return self.apply_result
+        if not self.apply_result:
+            return False
+        self.unapplied_changes = False
+        return True
 
     @property
     def total_applies(self):
@@ -839,22 +870,82 @@ def test_shutdown_before_nameserver_exists_does_not_crash(monkeypatch):
     assert fake_client.closed is True
 
 
-def test_failed_flush_reports_changes_remain_staged(monkeypatch, caplog):
+def test_a_failed_flush_keeps_changes_pending_for_retry(monkeypatch, caplog):
+    """
+    A failed apply must not discard the pending count.
+
+    Clearing it stranded the changes: the shutdown flush had nothing left to retry, so
+    aliases sat in the pfSense configuration and never went live.
+    """
     main, _fake_client = load_main(monkeypatch)
     nameserver = RecordingNameserver(apply_result=False)
     main.NAMESERVER = nameserver
-    # Stage under a long quiet window, then collapse it so the flush is due.
     monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+
     main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
     main.process_start_event("caddy.lab.internal", "b.lab.internal", "b")
-    assert main.PENDING_CHANGES == 1
-    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 0.0)
+    # Both are pending: the first because its immediate apply failed, the second
+    # because it was coalesced behind it.
+    assert main.PENDING_CHANGES == 2
 
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 0.0)
     with caplog.at_level(logging.ERROR):
         main.flush_pending_changes()
 
-    assert "staged in the pfSense configuration" in caplog.text
+    assert "remain staged" in caplog.text
+    assert main.PENDING_CHANGES == 2
+
+    # And they are still there for the shutdown flush to retry.
+    nameserver.apply_result = True
+    main.flush_pending_changes(force=True)
     assert main.PENDING_CHANGES == 0
+    assert nameserver.unapplied_changes is False
+
+
+def test_a_stranded_change_is_retried_rather_than_lost(monkeypatch):
+    """
+    A mutation that lands but fails to apply must stay tracked.
+
+    The mutator returns False in that case, which previously read as "nothing happened",
+    so nothing was pending and the alias never went live.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver(apply_result=False)
+    main.NAMESERVER = nameserver
+
+    main.process_start_event("caddy.lab.internal", "svc.lab.internal", "svc")
+
+    # The create landed even though the apply did not confirm.
+    assert nameserver.unapplied_changes is True
+    assert main.PENDING_CHANGES == 1
+
+    # pfSense recovers; shutdown flushes the stranded change.
+    nameserver.apply_result = True
+    main.flush_pending_changes(force=True)
+
+    assert nameserver.flush_applies == 1
+    assert nameserver.unapplied_changes is False
+    assert main.PENDING_CHANGES == 0
+
+
+def test_a_failed_flush_defers_the_next_attempt(monkeypatch):
+    """A pfSense outage must not be retried on every two-second window tick."""
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver(apply_result=False)
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 3600.0)
+
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 0.0)
+    main.flush_pending_changes()
+    assert nameserver.flush_applies == 1
+
+    # Timers were pushed out, so an immediate second tick does not retry.
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    main.flush_pending_changes()
+    assert nameserver.flush_applies == 1
+    assert main.PENDING_CHANGES == 1
 
 
 def test_iter_events_yields_a_tick_after_each_window(monkeypatch):
@@ -938,6 +1029,7 @@ def test_a_failed_add_stages_nothing(monkeypatch):
     main, _fake_client = load_main(monkeypatch)
     applies = []
     main.NAMESERVER = types.SimpleNamespace(
+        unapplied_changes=False,
         add_host_override_alias=lambda *_args, **_kwargs: False,
         del_host_override_alias=lambda *_args, **_kwargs: False,
         apply_changes=lambda: applies.append("apply") or True,

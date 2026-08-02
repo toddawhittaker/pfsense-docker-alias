@@ -23,6 +23,15 @@ services:
       #
       # Uncomment to scan and add aliases for existing containers on startup
       # ADD_ALIASES_ON_STARTUP: "true"
+      #
+      # Seconds without a new container event before staged DNS changes are
+      # applied together. A burst of container starts costs one reload, not one
+      # reload per alias.
+      # APPLY_QUIET_SECONDS: "10"
+      #
+      # Upper bound on how long staged changes wait, so continuous container
+      # churn cannot delay them indefinitely.
+      # APPLY_MAX_WAIT_SECONDS: "60"
       
     volumes:
       # Mount the Docker socket for listening to container events

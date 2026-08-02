@@ -755,3 +755,150 @@ def test_apply_changes_treats_a_malformed_status_body_as_not_applied(monkeypatch
     client = PFSense("pfsense.lab.internal", "secret-token")
 
     assert client.apply_changes() is False
+
+
+# --- Failures must log and return False, never raise --------------------------
+
+
+def test_malformed_host_override_payload_does_not_raise(monkeypatch, caplog):
+    """
+    A well-formed 200 with an unexpected body used to raise KeyError/TypeError straight
+    out of this module, which exits the service instead of logging and carrying on.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    for payload in (
+        {"data": [{"host": "caddy", "domain": "lab.internal"}]},   # no id
+        {"data": [{"host": "caddy"}]},                              # no domain
+        {"data": {"unexpected": "dict"}},                           # not a list
+        {"data": ["a string", 42, None]},                           # not dicts
+        {"data": [{"host": "caddy", "domain": "lab.internal", "aliases": "nope"}]},
+        {"data": [{"host": "caddy", "domain": "lab.internal", "aliases": [None, 7]}]},
+        {"nodata": True},
+    ):
+        def responder(_payload=payload, **_kwargs):
+            return FakeResponse(_payload)
+
+        monkeypatch.setattr("pfsense.requests.get", responder)
+        monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+        monkeypatch.setattr("pfsense.requests.delete", lambda **_kwargs: FakeResponse())
+
+        with caplog.at_level(logging.WARNING):
+            # The contract is "log and return False", never raise.
+            assert client.add_host_override_alias(
+                "caddy.lab.internal", "nginx.lab.internal"
+            ) is False
+            assert client.del_host_override_alias(
+                "caddy.lab.internal", "nginx.lab.internal"
+            ) is False
+            client.find_host_name("caddy.lab.internal")
+
+
+def test_host_override_without_an_id_is_reported_not_raised(monkeypatch, caplog):
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.ERROR):
+        assert not client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+    assert "no id" in caplog.text
+
+
+def test_alias_without_an_id_is_reported_not_raised(monkeypatch, caplog):
+    monkeypatch.setattr("pfsense.requests.delete", lambda **_kwargs: FakeResponse())
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [{"host": "nginx", "domain": "lab.internal"}],
+        }
+    ]
+
+    with caplog.at_level(logging.ERROR):
+        assert not client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+
+    assert "missing an id" in caplog.text
+
+
+def test_an_unreadable_ca_bundle_does_not_escape_as_oserror(monkeypatch):
+    """
+    requests raises a bare OSError, not a RequestException, when `verify` names an
+    unreadable path. Letting it escape crash-looped the container.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def missing_bundle(**_kwargs):
+        raise OSError("Could not find a suitable TLS CA certificate bundle")
+
+    monkeypatch.setattr("pfsense.requests.get", missing_bundle)
+    monkeypatch.setattr("pfsense.requests.post", missing_bundle)
+    monkeypatch.setattr("pfsense.requests.delete", missing_bundle)
+
+    client = PFSense("pfsense.lab.internal", "secret-token", ca_bundle="/missing/ca.pem")
+
+    assert client.get_all_host_overrides() == []
+    assert client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
+    assert client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
+    assert client.apply_changes() is False
+
+
+# --- Staged changes stay tracked until confirmed applied ----------------------
+
+
+def test_a_landed_mutation_marks_unapplied_changes(monkeypatch):
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(applied=False))
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    assert client.unapplied_changes is False
+    # The create lands but the apply never confirms.
+    assert client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is False
+    assert client.unapplied_changes is True
+
+
+def test_a_confirmed_apply_clears_unapplied_changes(monkeypatch):
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(applied=True))
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.unapplied_changes = True
+
+    assert client.apply_changes() is True
+    assert client.unapplied_changes is False
+
+
+def test_staging_logs_staged_not_added(monkeypatch, caplog):
+    """An operator reading 'removed' must not be told a name is gone while it resolves."""
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.delete", lambda **_kwargs: FakeResponse())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [{"id": 34, "parent_id": 12, "host": "gone", "domain": "lab.internal"}],
+        }
+    ]
+
+    with caplog.at_level(logging.INFO):
+        client.add_host_override_alias(
+            "caddy.lab.internal", "nginx.lab.internal", "n", apply=False
+        )
+        client.del_host_override_alias("caddy.lab.internal", "gone.lab.internal", apply=False)
+
+    assert "staged for host override" in caplog.text
+    assert "staged for removal" in caplog.text
+    assert "added to host override" not in caplog.text
+    assert "removed from host override" not in caplog.text
