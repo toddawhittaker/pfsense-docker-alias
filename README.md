@@ -176,10 +176,10 @@ Use these labels on your services to automatically generate aliases in pfSense D
 
 | Label Name                   | Required | Description                                                           |
 |------------------------------|----------|-----------------------------------------------------------------------|
-| `pfsense.dns.override`       | Yes      | The **existing** DNS host override in pfSense to associate the alias. |
-| `pfsense.dns.alias`          | Yes      | The DNS alias to add for this container.                              |
+| `pfsense.dns.override`       | Yes      | The **existing** DNS host override in pfSense to associate the alias. Maximum 253 characters (RFC 1035). |
+| `pfsense.dns.alias`          | Yes      | The DNS alias to add for this container. Maximum 253 characters (RFC 1035); each dot-separated label is at most 63 characters and may contain only letters, digits, and hyphens. |
 | `pfsense.dns.remove_on_stop` | No       | Remove the alias when the container stops or exits. Must be exactly `true`. |
-| `pfsense.dns.description`    | No       | Description for the alias                                             |
+| `pfsense.dns.description`    | No       | Description for the alias. Free text. Unprintable characters are replaced with spaces and the value is capped at 255 characters. |
 
 ## Example `docker-compose.yaml` configuring an NGINX web server 🐳
 The following example demonstrates how to use the labels for automatically creating aliases. Note that the host override must currently exist in pfSense.
@@ -202,6 +202,7 @@ services:
 
 - Replace `caddy.lab.internal` with the fully qualified hostname of your reverse proxy. Make sure it exists as a host override in pfSense.
 - Replace `nginx.lab.internal` with the fully qualified hostname of the service you're deploying.
+- An alias longer than 253 characters is rejected with a warning and cannot be resolved by DNS anyway. If one already exists in pfSense from an earlier version of this service, remove it in the webGUI — this service will decline to touch it.
 
 ## Contributing 💻
 

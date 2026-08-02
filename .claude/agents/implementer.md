@@ -26,7 +26,8 @@ The planner rules. If it says the test is right, fix your code. If it says the t
 - A new runtime module needs a matching `COPY` in the `Dockerfile`. Forget it and the image builds cleanly, then dies at import — only the CI smoke test catches it.
 - New module-level state in `main.py` must survive repeated import, because `tests/test_main.py` pops and re-imports the module for nearly every test.
 - Every pfSense mutation is two calls: the mutation, then POST to `/dns_resolver/apply`. Both must succeed to return `True`.
-- Route anything FQDN-derived through `_split_fqdn`. It is the injection barrier between container labels and API payloads.
+- Route anything FQDN-derived through `_split_fqdn`. It is the injection barrier between container labels and API payloads, and it rejects any value over `MAX_FQDN_CHARS` (253, RFC 1035) before splitting it, with no separate label-count cap needed.
+- Route any free-text field that reaches an API payload (today, the alias description) through `clean_alias_descr`. It replaces unprintable characters with a space and truncates to `ALIAS_DESCR_MAX_CHARS` (255) with no marker — it cleans and keeps going, it does not reject, because a bad name is a bad DNS record but a bad description is cosmetic.
 - Never log tokens, secrets, auth headers, sensitive env values, or API response bodies.
 - Keep the failure asymmetry: pfSense API errors log and return `False`; Docker event-stream errors re-raise so the container exits non-zero and restarts.
 

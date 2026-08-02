@@ -69,6 +69,37 @@ APPLY_POLL_ATTEMPTS = 15
 APPLY_POLL_DELAY_SECONDS = 1
 DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
+# RFC 1035 bounds a domain name at 255 octets on the wire. In presentation format that
+# is 253 characters: each label is preceded by a one-octet length byte instead of a
+# dot, so the wire form is sum(len(label) + 1) + 1 (trailing root octet), while the
+# presentation form is sum(len(label)) + (count - 1) dots -- exactly two less. A name
+# over 253 characters cannot be encoded into a DNS query, so no client could ever
+# resolve it; rejecting it costs an operator nothing they could have used.
+#
+# There is deliberately no separate label-count cap: 253 characters already bounds the
+# count at 127 by construction, since ".".join(["a"] * 127) is exactly 253 characters
+# (127 single-character labels + 126 dots). DNS_LABEL_PATTERN's 63-character label cap
+# does not bound the total; a length check on the joined FQDN is the only thing that does.
+MAX_FQDN_CHARS = 253
+
+# 255 is OUR bound, not a limit pfSense is known to enforce on this object. No
+# field-length limit for a DNS-resolver host-override alias description was
+# determined; reading upstream source established only how the value is rendered
+# (services_unbound.php escapes it with htmlspecialchars() for display), not how
+# long it may be. A pfSense host-override alias description is free text, not a
+# name, so there is no operator-facing reason to bound it tightly -- 255 is
+# comfortably under any plausible field limit while still stopping an unbounded
+# value from being written into firewall config.
+#
+# This caps characters, not bytes: 255 emoji is 1020 UTF-8 bytes. If the real
+# field is byte-bounded and lower than that, a description this long draws a 4xx
+# from pfSense. That degrades the same way any other rejected mutation does:
+# raise_for_status() raises, _handle_api_error logs the status without the
+# response body, add_host_override_alias returns False, unapplied_changes stays
+# False, and the service keeps running. Self-inflicted by the label author, and
+# it cannot poison a coalesced batch since a failed add stages nothing.
+ALIAS_DESCR_MAX_CHARS = 255
+
 # The injection barrier for logs, as _split_fqdn is for API payloads. Externally
 # supplied values (container labels, API responses) must never reach a log call
 # unsanitized, or a newline can fabricate a complete, syntactically valid log record.
@@ -94,6 +125,32 @@ def sanitize_for_log(value):
         return escaped[:LOG_VALUE_MAX_CHARS] + LOG_TRUNCATION_MARKER
     return escaped
 
+
+def clean_alias_descr(value):
+    """
+    Render a value safely for the pfSense alias description field.
+
+    This is the payload barrier for free text, as _split_fqdn is for names -- but it
+    REPLACES rather than escapes, and it is not sanitize_for_log(). A description is
+    written into the pfSense configuration and shown in the webGUI, so the goal is a
+    value that is harmless to store and display, not one that round-trips to the
+    original or carries a truncation marker: escaping would put log furniture
+    (backslash-n, "...(truncated)") into firewall config, which is worse than the
+    problem it would be fixing.
+
+    Every non-printable character (including newline, carriage return, and line
+    separator code points) becomes a single space, and the result is capped at
+    ALIAS_DESCR_MAX_CHARS with no marker -- truncation here is silent because the
+    marker is a log convention, not a fact about stored config. Unlike
+    sanitize_for_log(), the replace-then-truncate order here is not load-bearing:
+    the replacement is strictly one-to-one, so replacing first and truncating
+    first produce the same result.
+    """
+    text = value if isinstance(value, str) else str(value)
+    cleaned = "".join(c if c.isprintable() else " " for c in text)
+    return cleaned[:ALIAS_DESCR_MAX_CHARS]
+
+
 class PFSense:
     """
     An abstraction of the pfSense server.
@@ -114,6 +171,15 @@ class PFSense:
         """Split a fully qualified domain name into host and domain parts."""
         if not isinstance(fqdn, str):
             logger.warning(f"Invalid FQDN during {context}.")
+            return None
+
+        # Checked before the split, not after: a 24 KB label-supplied value would
+        # otherwise be exploded into thousands of labels before being rejected.
+        if len(fqdn) > MAX_FQDN_CHARS:
+            logger.warning(
+                f"FQDN '{sanitize_for_log(fqdn)}' exceeds {MAX_FQDN_CHARS} characters "
+                f"during {context}."
+            )
             return None
 
         labels = fqdn.split('.')
@@ -360,11 +426,19 @@ class PFSense:
             )
             return False
 
+        cleaned_descr = clean_alias_descr(alias_descr)
+        if cleaned_descr != f'{alias_descr}':
+            logger.warning(
+                f"Alias description for {sanitize_for_log(alias_fqdn)} was cleaned "
+                "before sending to pfSense; unprintable characters are replaced and "
+                f"the description is capped at {ALIAS_DESCR_MAX_CHARS} characters."
+            )
+
         data = {
             'parent_id': f'{parent_id}',
             'host': f'{alias_host}',
             'domain': f'{alias_domain}',
-            'descr': f'{alias_descr}'
+            'descr': cleaned_descr
         }
         try:
             # Create new alias
