@@ -18,7 +18,7 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (57 tests)
+.venv/bin/python -m pytest                          # full suite (93 tests)
 .venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
@@ -105,13 +105,23 @@ Coalescing state (`PENDING_CHANGES`, `PENDING_SINCE`, `LAST_CHANGE_AT`, `LAST_AP
 
 ### The event loop yields window ticks
 
-`iter_events()` replaces a single blocking `client.events()` with contiguous bounded windows (`since`/`until`, `EVENT_WINDOW_SECONDS`), yielding `None` at each boundary so `main()` can call `flush_pending_changes()`. This keeps the loop **single threaded** — no timer thread, no lock, no signal-handler reentrancy — which is why the resilience contract still holds.
+`iter_events()` replaces a single blocking `client.events()` with contiguous bounded windows (`since`/`until`, `EVENT_WINDOW_SECONDS`), yielding `None` at each boundary so `main()` can call `flush_pending_changes()`. This keeps the loop **single threaded** — no timer thread, no lock — which is why the resilience contract still holds. Note that single-threading removes thread races, not signal-handler re-entry: a SIGTERM arriving mid-flush still re-enters `flush_pending_changes()` and can issue a second apply. That is bounded and non-corrupting, but do not read "single threaded" as "reentrant-safe".
 
 Windows are contiguous, so events between them are still delivered. An event landing exactly on a boundary may be delivered twice; that is harmless because adding an existing alias or removing an absent one is already detected and logged.
 
 Tests drive `main()` by monkeypatching `main.iter_events` with a finite iterable. Do not stub `client.events` for loop tests — `iter_events` loops forever by design, so main() would never return.
 
-With `apply=False`, a `True` return means **staged in the pfSense configuration but not yet live**. Staged changes persist and go live on the next successful apply.
+With `apply=False`, a `True` return means **staged in the pfSense configuration but not yet live**. Staged changes persist and go live on the next successful apply. The log says "staged", not "added"/"removed", because an operator reading "removed" while the name still resolves is worse than no message at all.
+
+**`PFSense.unapplied_changes` is the source of truth, not the return value.** A mutation can land while its apply fails, which returns `False` even though something is now staged. `unapplied_changes` is set as soon as the mutation POST succeeds and cleared only by a confirmed apply. `main._record_change_outcome()` consults it rather than the boolean — trusting the boolean stranded those changes, because nothing was pending so nothing ever retried and the alias never went live.
+
+For the same reason, **a failed flush keeps its changes pending**. `flush_pending_changes()` calls `_defer_retry()` rather than `_record_applied()` when the apply fails, so a later tick or the shutdown flush retries. `_defer_retry()` pushes the timers out a full quiet window so a pfSense outage is not retried on every two-second window tick.
+
+### API responses are untrusted input
+
+`get_all_host_overrides()` validates the payload shape — it returns `[]` for a non-list `data` and drops non-dict entries — and every accessor uses `.get()` rather than indexing. A well-formed 200 with an unexpected body previously raised `KeyError`/`TypeError` straight out of this module, which `main()` does not catch, exiting the service instead of logging and carrying on. An API schema change must degrade to a warning, never a crash loop.
+
+`_request` catches `OSError` as well as `RequestException`. `requests` raises a **bare `OSError`** when `verify` names an unreadable CA bundle, which used to escape every public method and crash-loop the container — pushing operators toward disabling TLS verification to get the service running. `main.py` also checks `PFSENSE_CA_BUNDLE` is readable at startup and exits with a clear message, since that is a configuration error worth failing loudly on.
 
 `add_host_override_alias` first calls `find_host_name(alias_fqdn)` to reject an alias already used as a host override or alias anywhere, then resolves the parent host override — the override must already exist in pfSense; this service never creates one.
 

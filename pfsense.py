@@ -77,6 +77,10 @@ class PFSense:
         self.pfsense_host = pfsense_host
         self.pfsense_api_key = pfsense_api_key
         self.verify_ssl = ca_bundle if ca_bundle else verify_ssl
+        # True whenever a mutation has landed in the pfSense configuration but has not
+        # been confirmed applied. Callers use it to keep retrying rather than assuming a
+        # False return meant nothing happened.
+        self.unapplied_changes = False
         if self.verify_ssl is False:
             urllib3.disable_warnings(InsecureRequestWarning)
         logger.info(f"pfSense host set to {self.pfsense_host}")
@@ -108,7 +112,10 @@ class PFSense:
         for attempt in range(1, attempts + 1):
             try:
                 return method(**kwargs)
-            except requests.RequestException as e:
+            # OSError, not just RequestException: requests raises a bare OSError when
+            # `verify` names an unreadable CA bundle. Letting that escape crash-looped
+            # the container, which pushed operators toward disabling verification.
+            except (requests.RequestException, OSError) as e:
                 if attempt == attempts:
                     self._handle_api_error(e, context)
                     return None
@@ -163,6 +170,7 @@ class PFSense:
         for attempt in range(1, APPLY_POLL_ATTEMPTS + 1):
             if self._changes_applied():
                 logger.info("DNS resolver changes applied.")
+                self.unapplied_changes = False
                 return True
 
             if attempt < APPLY_POLL_ATTEMPTS:
@@ -226,10 +234,19 @@ class PFSense:
             if response is None:
                 return []
             response.raise_for_status()
-            return response.json().get('data', [])
-        except (requests.RequestException, ValueError) as e:
+            data = response.json().get('data', [])
+        except (requests.RequestException, OSError, ValueError, AttributeError) as e:
             self._handle_api_error(e, "get_all_host_overrides")
             return []
+
+        # Validate the shape here so callers can index safely. An API schema change or
+        # a partial object previously raised KeyError/TypeError straight out of this
+        # module, which exits the service instead of logging and carrying on.
+        if not isinstance(data, list):
+            logger.error("Unexpected host override payload; expected a list.")
+            return []
+
+        return [entry for entry in data if isinstance(entry, dict)]
 
     def find_host_name(self, fqdn):
         """
@@ -244,7 +261,7 @@ class PFSense:
         host, domain = split_fqdn
         host_overrides = self.get_all_host_overrides()
         for host_override in host_overrides:
-            if host_override['host'] == host and host_override['domain'] == domain:
+            if host_override.get('host') == host and host_override.get('domain') == domain:
                 return host_override
             if self.find_alias_in_host_override(host_override, fqdn) is not None:
                 return host_override
@@ -263,16 +280,19 @@ class PFSense:
 
         alias_host, alias_domain = split_fqdn
 
-        alias = None
-        if 'aliases' in host_override and host_override['aliases']:
-            alias = next(
-                (
-                    al for al in host_override['aliases']
-                    if al['host'] == alias_host and al['domain'] == alias_domain
-                ),
-                None
-            )
-        return alias
+        aliases = host_override.get('aliases') or []
+        if not isinstance(aliases, list):
+            return None
+
+        return next(
+            (
+                al for al in aliases
+                if isinstance(al, dict)
+                and al.get('host') == alias_host
+                and al.get('domain') == alias_domain
+            ),
+            None
+        )
 
     def add_host_override_alias(self, host_override_fqdn, alias_fqdn, alias_descr="", apply=True):
         # pylint: disable=too-many-return-statements,redefined-builtin
@@ -306,8 +326,13 @@ class PFSense:
             logger.warning(f"Host override {host_override_fqdn} not found.")
             return False
 
+        parent_id = host_override.get("id")
+        if parent_id is None:
+            logger.error(f"Host override {host_override_fqdn} has no id; cannot add alias.")
+            return False
+
         data = {
-            'parent_id': f'{host_override["id"]}',
+            'parent_id': f'{parent_id}',
             'host': f'{alias_host}',
             'domain': f'{alias_domain}',
             'descr': f'{alias_descr}'
@@ -327,18 +352,26 @@ class PFSense:
                 return False
             response.raise_for_status()
 
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
             self._handle_api_error(e, "add_host_override_alias")
             return False
 
-        if apply and not self.apply_changes():
-            return False
+        # The alias now exists in the pfSense configuration whether or not the apply
+        # below succeeds. Recording that is what stops a failed apply from stranding
+        # the change with nothing tracking it.
+        self.unapplied_changes = True
 
-        logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
+        if apply:
+            if not self.apply_changes():
+                return False
+            logger.info(f"Alias {alias_fqdn} added to host override {host_override_fqdn}.")
+        else:
+            logger.info(f"Alias {alias_fqdn} staged for host override {host_override_fqdn}.")
+
         return True
 
     def del_host_override_alias(self, host_override_fqdn, alias_fqdn, apply=True):
-        # pylint: disable=redefined-builtin
+        # pylint: disable=redefined-builtin,too-many-return-statements
         """
         Removes an alias from an existing host override in pfSense.
 
@@ -359,9 +392,15 @@ class PFSense:
             logger.warning(f"Alias {alias_fqdn} not found in host override {host_override_fqdn}.")
             return False
 
+        parent_id = alias.get("parent_id")
+        alias_id = alias.get("id")
+        if parent_id is None or alias_id is None:
+            logger.error(f"Alias {alias_fqdn} is missing an id; cannot remove it.")
+            return False
+
         data = {
-            'parent_id': f'{alias["parent_id"]}',
-            'id': f'{alias["id"]}',
+            'parent_id': f'{parent_id}',
+            'id': f'{alias_id}',
         }
 
         try:
@@ -379,12 +418,17 @@ class PFSense:
                 return False
             response.raise_for_status()
 
-        except requests.RequestException as e:
+        except (requests.RequestException, OSError) as e:
             self._handle_api_error(e, "del_host_override_alias")
             return False
 
-        if apply and not self.apply_changes():
-            return False
+        self.unapplied_changes = True
 
-        logger.info(f"Alias {alias_fqdn} removed from host override {host_override_fqdn}.")
+        if apply:
+            if not self.apply_changes():
+                return False
+            logger.info(f"Alias {alias_fqdn} removed from host override {host_override_fqdn}.")
+        else:
+            logger.info(f"Alias {alias_fqdn} staged for removal from {host_override_fqdn}.")
+
         return True
