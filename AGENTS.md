@@ -38,6 +38,8 @@ Coverage config lives in `.coveragerc` rather than `pyproject.toml` on purpose �
 
 `actionlint` checks the workflow files and is not a pip package — download it when you need it. It shells out to `shellcheck` for `run:` blocks **only if shellcheck is on `PATH`**, and GitHub runners have it while a plain dev box usually does not. Local actionlint without shellcheck is therefore weaker than CI and will miss shell issues that fail the build; install shellcheck before trusting a local pass.
 
+CI installs it from a **pinned release asset verified against a SHA256**, not by piping upstream's install script into bash — that script is fetched from a branch we do not control and resolves `latest` at run time, and the job it runs in is triggered by `pull_request`. Dependabot does not track this pin, so it is the one version in this repo that drifts silently: bump `ACTIONLINT_VERSION` and `ACTIONLINT_SHA256` in `.github/workflows/docker-publish.yml` together, taking the hash for `linux_amd64` from the `actionlint_<version>_checksums.txt` published with the release. A version bump without a matching hash fails the `sha256sum -c` step, which is the intended failure — never drop the checksum to get past it.
+
 `pip-audit` runs `--strict` against both requirements files, so a newly disclosed CVE in a pinned dependency turns CI red without any code change. That is intended: this service ships TLS calls and an API token, and `certifi` *is* its trust store. Fix by bumping the pin, not by ignoring the finding. Dependabot (`.github/dependabot.yml`) opens weekly PRs for pip, GitHub Actions, and the base image to keep that from accumulating.
 
 ### Manual end-to-end check

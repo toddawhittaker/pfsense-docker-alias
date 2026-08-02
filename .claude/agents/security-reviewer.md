@@ -43,6 +43,10 @@ When reviewing any change to the payload barrier's helpers and their constants (
 
 Mounting `/var/run/docker.sock` grants effective root on the host. This is accepted and documented, but changes that widen it are findings: writing through the socket rather than reading events, running the container with added privileges, or the CI smoke test's socket mount migrating to a self-hosted runner where the host is persistent and shared rather than ephemeral.
 
+### 5. What CI executes
+
+The `test` job runs on `pull_request`, so anything it fetches and runs is reachable by a branch, from a fork. Executable third-party content must be pinned to an immutable reference: actionlint arrives as a version-pinned release asset checked against `ACTIONLINT_SHA256` before it is unpacked. Reintroducing a `curl … | bash`, pointing a download at a branch or at `latest`, or relaxing the checksum verification to make a bump pass is a finding — `grep -n 'curl' .github/workflows/*.yml` should turn up no pipe into a shell. Actions pinned to mutable major tags (`@v7`, `@v4`) are an accepted trade-off because Dependabot tracks and bumps them; the actionlint pin is *not* tracked, so check that a version bump moved the hash with it.
+
 ## How to review
 
 Start from the diff. For dependency changes, check the advisory status of what is being added or bumped and read release notes for major versions — a green CI check does **not** validate an action used only in the tag-gated `build-and-push` job, which never runs on a PR.

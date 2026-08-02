@@ -29,10 +29,25 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-dev.txt
 
+      # Installed from a pinned release asset with a checksum rather than by
+      # piping actionlint's install script into bash. That script is fetched
+      # from a branch we do not control and resolves `latest` at run time, so
+      # a compromise upstream would run arbitrary code in this job — which
+      # runs on `pull_request`. Dependabot does not track this pin: bump
+      # ACTIONLINT_VERSION and ACTIONLINT_SHA256 together by hand, taking the
+      # hash from the actionlint_<version>_checksums.txt published with the
+      # release.
       - name: Lint workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
-          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
-            | bash -s -- latest "${RUNNER_TEMP}"
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl -sSfL -o "${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" actionlint
           "${RUNNER_TEMP}/actionlint" -color
 
       - name: Compile Python files
