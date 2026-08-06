@@ -59,6 +59,14 @@ docker rm -f pfsense-alias-smoke smoke-nginx
 
 Expect start/stop to be detected, three retries per API call, an error log, and the service to **stay running** — that resilience is the contract, so a crash here is a regression.
 
+### The real end-to-end check, against a real pfSense
+
+`test-env/bootstrap.sh` builds a throwaway pfSense VM with the REST API package installed (about ten minutes and 6 GB of disk, entirely outside the working tree), and `test-env/smoke.sh` runs the service against it and asserts the whole path: alias created, resolving through the firewall's own resolver, removed on stop, service still alive. `test-env/vm.sh reset` rolls back to a clean snapshot in about a second. `test-env/README.md` is the reference; `CONTRIBUTING.md` says when to reach for it.
+
+This needs KVM, so it cannot run on GitHub's runners and is not part of CI. Run it by hand for any change touching `pfsense.py`, the apply/coalescing logic, or what goes into an API payload. The unit suite stubs both Docker and the API, so it can only confirm the client matches *our own idea* of the API — it cannot tell you whether a field lands where pfSense reads it, or whether a name resolves afterwards. Both of those questions have already been settled here in ways the suite could not have reached: the alias description really does arrive (the API's `descr` is written to `config.xml` as `description`, which is the key the webGUI renders), and `--rm` containers can lose their alias removal entirely, because the stop handler reads labels back from a container Docker has already deleted.
+
+Two things about that environment are worth knowing before using it. Every request from the host reaches pfSense from one address, so its brute-force protection can blackhole SSH, the webGUI and the REST API simultaneously while the serial console still looks healthy — `bootstrap.sh` whitelists it, but suspect it first if everything goes quiet at once. And containers cannot reach the VM through QEMU's port forwarding directly; `test-env/relay.sh` bridges that gap.
+
 CI (`.github/workflows/docker-publish.yml`) runs on every PR and push to `main`: actionlint → compile → pylint → pip-audit → pytest with the coverage gate → `docker build` → two container smoke tests. The smoke tests run the built image and assert it exits 1 with a config error when unconfigured, then boots and reaches its event loop when configured. They exist because `docker build` cannot catch a runtime module missing its `COPY` — that image builds cleanly and dies at import. The ghcr.io publish job runs only on tag pushes.
 
 ## Architecture
