@@ -1,4 +1,6 @@
 README.md
+CONTRIBUTING.md
+test-env/
 LICENSE
 .git/
 .dockerignore
