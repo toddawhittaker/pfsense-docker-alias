@@ -19,7 +19,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 REPO_DIR="$(cd "$TEST_ENV_DIR/.." && pwd)"
 SERVICE="smoke-alias-service"
 TARGET="smoke-target"
+EPHEMERAL="smoke-ephemeral"
 ALIAS_NAME="smoke.$PARENT_DOMAIN"
+EPHEMERAL_ALIAS="ephemeral.$PARENT_DOMAIN"
 DESCRIPTION="set by smoke.sh"
 IMAGE="pfsense-docker-alias:smoke"
 
@@ -29,13 +31,14 @@ pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILURES=$(( FAILURES + 1 )); }
 
 cleanup() {
-  docker rm -f "$SERVICE" "$TARGET" >/dev/null 2>&1 || true
+  docker rm -f "$SERVICE" "$TARGET" "$EPHEMERAL" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 resolves()     { [[ -n "$(dig +short +timeout=3 "@127.0.0.1" -p "$DNS_PORT" "$1" 2>/dev/null)" ]]; }
 not_resolves() { ! resolves "$1"; }
 logged()       { docker logs "$SERVICE" 2>&1 | grep -q "$1"; }
+container_gone() { ! docker inspect "$1" >/dev/null 2>&1; }
 
 # assert_within DESCRIPTION TIMEOUT PREDICATE [ARGS...]
 #
@@ -87,8 +90,8 @@ assert_within "the service reaches its event loop" 60 logged "Listening for cont
 # --------------------------------------------------------------------------
 log "a labelled container should create an alias that resolves"
 
-# Deliberately not --rm. A container Docker has already deleted cannot have its
-# labels read back when it stops, so its alias is left behind; see the README.
+# Deliberately not --rm: this is the path where the container is still there when it
+# stops and its labels can be read back. The --rm case is exercised separately below.
 docker run -d --name "$TARGET" \
   -l "pfsense.dns.override=$PARENT_HOST.$PARENT_DOMAIN" \
   -l "pfsense.dns.alias=$ALIAS_NAME" \
@@ -126,6 +129,30 @@ docker stop "$TARGET" >/dev/null
 
 assert_within "the service logs the alias as removed" 120 logged "$ALIAS_NAME removed"
 assert_within "$ALIAS_NAME stops resolving" 120 not_resolves "$ALIAS_NAME"
+
+# --------------------------------------------------------------------------
+log "a --rm container should lose its alias too, though Docker deletes it first"
+
+# The regression that motivated recording alias configuration at start: Docker
+# removes this container as it stops, so its labels cannot be read back and the
+# removal has to come from what was recorded when it started.
+#
+# Treat this as a live sanity check rather than the regression guard. A single
+# --rm container often used to be removed correctly anyway, because the service
+# sometimes won the race to read the labels; it took a batch stopping together to
+# lose them reliably. The deterministic guard is
+# tests/test_main.py::test_a_burst_of_deleted_containers_removes_every_alias.
+docker run -d --rm --name "$EPHEMERAL" \
+  -l "pfsense.dns.override=$PARENT_HOST.$PARENT_DOMAIN" \
+  -l "pfsense.dns.alias=$EPHEMERAL_ALIAS" \
+  -l "pfsense.dns.remove_on_stop=true" \
+  alpine sleep 600 >/dev/null
+
+assert_within "$EPHEMERAL_ALIAS resolves" 120 resolves "$EPHEMERAL_ALIAS"
+
+docker stop "$EPHEMERAL" >/dev/null
+assert_within "the container is really gone" 60 container_gone "$EPHEMERAL"
+assert_within "$EPHEMERAL_ALIAS stops resolving anyway" 120 not_resolves "$EPHEMERAL_ALIAS"
 
 # --------------------------------------------------------------------------
 log "the service should still be running"

@@ -102,12 +102,12 @@ off pfRest's own login protection. If you still manage to trip it:
 PFSENSE_LAB_DIR=... python3 test-env/lib/sendkeys.py "pfctl -t sshguard -T flush{ENTER}"
 ```
 
-**`--rm` and `remove_on_stop` do not reliably combine.** The service reads a
-stopping container's labels back from the Docker API, and Docker may have
-already deleted a container started with `--rm`. One container stopped on its
-own is usually fine; twenty stopped at once left 19 aliases orphaned. This is a
-property of the service, not of the test environment — `smoke.sh` avoids `--rm`
-deliberately.
+**`--rm` containers were the first real bug this environment found.** Docker can
+delete a container started with `--rm` before its stop event is handled, so its
+labels are unreadable and the alias was left behind: twenty stopped at once
+orphaned nineteen aliases. The service now records alias configuration at start
+and falls back to it, and `smoke.sh` asserts both paths — a container whose
+labels are still readable, and one Docker has already deleted.
 
 **Arrow keys cancel installer dialogs.** Over this serial console `dialog(1)`
 reads the leading ESC of `ESC [ B` as a bare escape and treats it as cancel,

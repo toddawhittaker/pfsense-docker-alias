@@ -63,7 +63,7 @@ Expect start/stop to be detected, three retries per API call, an error log, and 
 
 `test-env/bootstrap.sh` builds a throwaway pfSense VM with the REST API package installed (about ten minutes and 6 GB of disk, entirely outside the working tree), and `test-env/smoke.sh` runs the service against it and asserts the whole path: alias created, resolving through the firewall's own resolver, removed on stop, service still alive. `test-env/vm.sh reset` rolls back to a clean snapshot in about a second. `test-env/README.md` is the reference; `CONTRIBUTING.md` says when to reach for it.
 
-This needs KVM, so it cannot run on GitHub's runners and is not part of CI. Run it by hand for any change touching `pfsense.py`, the apply/coalescing logic, or what goes into an API payload. The unit suite stubs both Docker and the API, so it can only confirm the client matches *our own idea* of the API — it cannot tell you whether a field lands where pfSense reads it, or whether a name resolves afterwards. Both of those questions have already been settled here in ways the suite could not have reached: the alias description really does arrive (the API's `descr` is written to `config.xml` as `description`, which is the key the webGUI renders), and `--rm` containers can lose their alias removal entirely, because the stop handler reads labels back from a container Docker has already deleted.
+This needs KVM, so it cannot run on GitHub's runners and is not part of CI. Run it by hand for any change touching `pfsense.py`, the apply/coalescing logic, or what goes into an API payload. The unit suite stubs both Docker and the API, so it can only confirm the client matches *our own idea* of the API — it cannot tell you whether a field lands where pfSense reads it, or whether a name resolves afterwards. Two things were settled here that the suite could not have reached: the alias description really does arrive (the API's `descr` is written to `config.xml` as `description`, which is the key the webGUI renders), and stopping twenty `--rm` containers at once orphaned nineteen aliases, which is the finding behind "A stopping container may already be gone" below.
 
 Two things about that environment are worth knowing before using it. Every request from the host reaches pfSense from one address, so its brute-force protection can blackhole SSH, the webGUI and the REST API simultaneously while the serial console still looks healthy — `bootstrap.sh` whitelists it, but suspect it first if everything goes quiet at once. And containers cannot reach the VM through QEMU's port forwarding directly; `test-env/relay.sh` bridges that gap.
 
@@ -114,6 +114,22 @@ The same burst arrives through the event loop — a `docker compose up` of twent
 Coalescing state (`PENDING_CHANGES`, `PENDING_SINCE`, `LAST_CHANGE_AT`, `LAST_APPLY_AT`) is module level and measured with `time.monotonic()`, so a wall-clock adjustment cannot strand pending changes. Note that `LAST_APPLY_AT = 0.0` reads as *long ago*, not *just now* — tests that need "an apply just happened" must set `time.monotonic()`.
 
 **`cleanup()` flushes before exit.** A SIGTERM with staged changes would otherwise leave them in the config but never live. It guards on `NAMESERVER is not None`, since a signal can arrive before `main()` constructs it, and swallows flush errors so a broken apply cannot block shutdown. Docker's default 10s stop grace can still cut a slow apply short; the changes stay staged and go live on the next apply.
+
+### A stopping container may already be gone
+
+`handle_container_event` cannot rely on reading a stopping container's labels back from Docker. A container run with `docker run --rm` is deleted as it stops, and Docker frequently wins that race: `client.containers.get` raises `NotFound`, and the handler used to log "Container not found" and return, leaving the alias in pfSense. Measured against the test VM, one such container stopping alone was usually fine and **twenty stopping together orphaned nineteen aliases**. The unit suite could not see this at all, because it stubs the Docker client so the lookup always succeeds.
+
+So `remember_alias_config()` records `(container_name, alias_config)` in `KNOWN_ALIASES`, keyed by container ID, whenever a start event is handled — and in `add_aliases_on_startup`, which is the only chance to record a container that was already running when this service started. On `NotFound`, `recall_alias_config()` supplies the fallback and the removal proceeds. When nothing was recorded, the original warning still fires.
+
+Three properties are deliberate:
+
+- **Only a stop is answered from the record.** `recall_alias_config` returns `None` for any action other than `stop`/`die`. A start event for a container that has already gone is genuinely nothing to act on, and treating it as a removal would delete an alias in response to the wrong event.
+- **The `remove_on_stop` opt-in still applies.** The recorded configuration is checked the same way a live label read would be, so falling back never removes an alias the labels did not ask to remove.
+- **Entries are not dropped on stop.** Docker emits both `die` and `stop` for one shutdown, and the second event must reach the same answer as the first. Removing the entry on the first would make the second log "Container not found" for a container that was handled correctly a moment earlier.
+
+That last choice means container IDs — which are never reused — would accumulate for the life of the process, so `KNOWN_ALIASES_MAX` (512) bounds the table and the oldest entry is evicted on overflow. Eviction relies on dictionaries preserving insertion order; `remember_alias_config` deletes before reinserting so a re-recorded container counts as newest. The second removal attempt costs one API call and no extra apply: `del_host_override_alias` returns `False` without mutating when the alias is already absent, so `unapplied_changes` stays clear and `_record_change_outcome` does nothing.
+
+This is bounded, not unlimited memory: a container that starts, is recorded, and stops more than 512 container-starts later has been evicted, and its `--rm` removal fails the old way. Raising the cap trades memory for that window.
 
 ### The event loop yields window ticks
 
