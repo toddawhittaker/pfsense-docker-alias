@@ -87,6 +87,18 @@ PENDING_SINCE = None
 LAST_CHANGE_AT = None
 LAST_APPLY_AT = None
 
+# Alias configuration recorded when a container is first seen, keyed by container ID.
+# Handling a stop used to depend on reading the container's labels back from Docker,
+# which fails for a container run with `docker run --rm`: Docker can delete it before
+# the stop event is handled, and the alias was then left behind. Twenty such containers
+# stopped together left nineteen aliases orphaned.
+KNOWN_ALIASES = {}
+# Container IDs are never reused, so nothing here can be evicted by a later start of
+# the same container and the table would otherwise grow for the life of the process.
+# Entries are also deliberately not dropped on stop: Docker sends both `die` and `stop`
+# for one shutdown, and the second event must find the same answer as the first.
+KNOWN_ALIASES_MAX = 512
+
 # Initialize Docker client
 try:
     client = docker.from_env()
@@ -120,6 +132,9 @@ def add_aliases_on_startup():
             continue
 
         labeled += 1
+        # A container already running when this service starts never produces a start
+        # event, so this scan is the only chance to record it for a later stop.
+        remember_alias_config(container.id, container.name, alias_config)
         logger.info(
             f"Staging alias '{pfsense.sanitize_for_log(alias_config['alias_fqdn'])}' "
             f"for container '{pfsense.sanitize_for_log(container.name)}'"
@@ -208,6 +223,40 @@ def get_alias_event_action(event_action, labels):
 
     return None
 
+def remember_alias_config(container_id, container_name, alias_config):
+    """Record a container's alias configuration so a later stop does not need Docker."""
+    KNOWN_ALIASES.pop(container_id, None)
+    KNOWN_ALIASES[container_id] = (container_name, alias_config)
+    while len(KNOWN_ALIASES) > KNOWN_ALIASES_MAX:
+        # Dictionaries keep insertion order, so the first key is the oldest entry.
+        KNOWN_ALIASES.pop(next(iter(KNOWN_ALIASES)))
+
+def recall_alias_config(container_id, event_action):
+    """
+    Alias configuration recorded for a container Docker can no longer describe.
+
+    Only a stop is answered from the record. A start event for a container that has
+    already gone is genuinely nothing to act on, and treating it as a removal would
+    delete an alias in response to the wrong event.
+    """
+    if event_action not in ['stop', 'die']:
+        return None
+
+    remembered = KNOWN_ALIASES.get(container_id)
+    if remembered is None:
+        return None
+
+    _container_name, alias_config = remembered
+    if not alias_config["remove_on_stop"]:
+        return None
+
+    return remembered
+
+def _remove_alias_for(container_name, alias_config):
+    """Log and dispatch the removal of a stopping container's alias."""
+    logger.info(f"Container '{pfsense.sanitize_for_log(container_name)}' is stopping...")
+    process_stop_event(alias_config["host_override_fqdn"], alias_config["alias_fqdn"])
+
 def handle_container_event(event):
     """Handle a Docker container start/stop event."""
     container_id = event.get('Actor', {}).get('ID')
@@ -215,10 +264,19 @@ def handle_container_event(event):
         logger.warning("Ignoring container event with missing container ID.")
         return
 
+    event_action = event.get('Action')
+
     try:
         container = client.containers.get(container_id)
     except docker.errors.NotFound as e:
-        logger.warning(f"Container not found: {pfsense.sanitize_for_log(e)}")
+        # Expected for a container run with `--rm`, which Docker may delete before this
+        # event is handled. Its labels are unreadable now, so fall back to what was
+        # recorded when it started rather than leaving the alias behind.
+        remembered = recall_alias_config(container_id, event_action)
+        if remembered is None:
+            logger.warning(f"Container not found: {pfsense.sanitize_for_log(e)}")
+            return
+        _remove_alias_for(*remembered)
         return
     except docker.errors.DockerException as e:
         _handle_error(e, "handle_container_event")
@@ -226,13 +284,14 @@ def handle_container_event(event):
 
     labels = get_container_labels(container)
 
-    alias_action = get_alias_event_action(event.get('Action'), labels)
+    alias_action = get_alias_event_action(event_action, labels)
     if not alias_action:
         return
 
     action, alias_config = alias_action
 
     if action == "add":
+        remember_alias_config(container_id, container.name, alias_config)
         logger.info(f"Container '{pfsense.sanitize_for_log(container.name)}' is starting...")
         process_start_event(
             alias_config["host_override_fqdn"],
@@ -240,8 +299,7 @@ def handle_container_event(event):
             alias_config["alias_descr"]
         )
     elif action == "remove":
-        logger.info(f"Container '{pfsense.sanitize_for_log(container.name)}' is stopping...")
-        process_stop_event(alias_config["host_override_fqdn"], alias_config["alias_fqdn"])
+        _remove_alias_for(container.name, alias_config)
 
 def should_apply_immediately():
     """

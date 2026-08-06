@@ -203,7 +203,7 @@ services:
 - Replace `caddy.lab.internal` with the fully qualified hostname of your reverse proxy. Make sure it exists as a host override in pfSense.
 - Replace `nginx.lab.internal` with the fully qualified hostname of the service you're deploying.
 - An alias longer than 253 characters is rejected with a warning and cannot be resolved by DNS anyway. If one already exists in pfSense from an earlier version of this service, remove it in the webGUI — this service will decline to touch it.
-- `pfsense.dns.remove_on_stop=true` does not combine reliably with `docker run --rm`. This service reads a stopping container's labels back from Docker, and Docker may already have deleted a container started with `--rm`, in which case the alias is left behind. A single container stopping on its own is usually fine; a batch stopping together is not. Prefer `docker compose` or a container without `--rm` when you rely on removal.
+- `pfsense.dns.remove_on_stop=true` works with `docker run --rm`. This service records a container's alias configuration when it starts, so a container Docker has already deleted by the time its stop event arrives still has its alias removed. Containers already running before this service starts are only recorded when `ADD_ALIASES_ON_STARTUP` is enabled; without it, a pre-existing `--rm` container that stops may leave its alias behind.
 
 ## Contributing 💻
 

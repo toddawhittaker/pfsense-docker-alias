@@ -250,6 +250,7 @@ def test_add_aliases_on_startup_adds_labeled_running_containers(monkeypatch):
     calls = []
     fake_client.containers.list = lambda: [
         types.SimpleNamespace(
+            id="id-nginx",
             name="nginx",
             attrs={
                 "Config": {
@@ -261,7 +262,9 @@ def test_add_aliases_on_startup_adds_labeled_running_containers(monkeypatch):
                 }
             },
         ),
-        types.SimpleNamespace(name="unlabeled", attrs={"Config": {"Labels": {}}}),
+        types.SimpleNamespace(
+            id="id-unlabeled", name="unlabeled", attrs={"Config": {"Labels": {}}}
+        ),
     ]
     applies = []
     main.NAMESERVER = types.SimpleNamespace(
@@ -602,6 +605,7 @@ def test_main_runs_startup_scan_only_when_enabled(monkeypatch):
 
 def _labeled_container(name, alias):
     return types.SimpleNamespace(
+        id=f"id-{name}",
         name=name,
         attrs={
             "Config": {
@@ -1264,3 +1268,181 @@ def test_docker_client_init_failure_log_cannot_forge_a_log_record(monkeypatch, c
     assert "boom" in critical[0]
     assert "forged" in critical[0]
     assert "Error initializing Docker client" in caplog.text
+
+
+# --- Remembering aliases so a deleted container can still be cleaned up -------
+
+
+def _remembering_container(container_id, name, alias, remove_on_stop=True):
+    labels = {
+        "pfsense.dns.override": "caddy.lab.internal",
+        "pfsense.dns.alias": alias,
+    }
+    if remove_on_stop:
+        labels["pfsense.dns.remove_on_stop"] = "true"
+    return types.SimpleNamespace(
+        id=container_id,
+        name=name,
+        attrs={"Config": {"Labels": labels}},
+    )
+
+
+def _container_is_gone(fake_client):
+    def gone(_container_id):
+        raise DockerNotFound("no such container")
+
+    fake_client.containers.get = gone
+
+
+def test_a_deleted_container_still_loses_its_alias_on_stop(monkeypatch):
+    """
+    A container run with `docker run --rm` is often deleted before its stop event is
+    handled, so its labels can no longer be read back from Docker. The alias must
+    still be removed, from what was recorded when the container started.
+    """
+    main, fake_client = load_main(monkeypatch)
+    removals = []
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+    monkeypatch.setattr(
+        main,
+        "process_stop_event",
+        lambda host_override, alias: removals.append((host_override, alias)),
+    )
+
+    fake_client.container = _remembering_container("abc123", "nginx", "nginx.lab.internal")
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    _container_is_gone(fake_client)
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
+
+    assert removals == [("caddy.lab.internal", "nginx.lab.internal")]
+
+
+def test_a_burst_of_deleted_containers_removes_every_alias(monkeypatch):
+    """
+    The regression this exists for. Twenty `--rm` containers stopped together left
+    nineteen aliases behind against a real pfSense, because Docker won the race to
+    delete each container before its stop event was handled.
+    """
+    main, fake_client = load_main(monkeypatch)
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+    removals = []
+    monkeypatch.setattr(
+        main, "process_stop_event", lambda _host_override, alias: removals.append(alias)
+    )
+
+    for index in range(20):
+        fake_client.container = _remembering_container(
+            f"id-{index}", f"svc{index}", f"svc{index}.lab.internal"
+        )
+        main.handle_container_event({"Actor": {"ID": f"id-{index}"}, "Action": "start"})
+
+    _container_is_gone(fake_client)
+    for index in range(20):
+        main.handle_container_event({"Actor": {"ID": f"id-{index}"}, "Action": "stop"})
+
+    assert removals == [f"svc{index}.lab.internal" for index in range(20)]
+
+
+def test_a_container_never_seen_starting_still_reports_not_found(monkeypatch, caplog):
+    """Nothing was recorded, so there is nothing to fall back to — say so and move on."""
+    main, fake_client = load_main(monkeypatch)
+    removals = []
+    monkeypatch.setattr(
+        main, "process_stop_event", lambda host_override, alias: removals.append((host_override, alias))
+    )
+    _container_is_gone(fake_client)
+
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {"ID": "never-seen"}, "Action": "stop"})
+
+    assert removals == []
+    assert "Container not found" in caplog.text
+
+
+def test_a_deleted_container_without_remove_on_stop_keeps_its_alias(monkeypatch, caplog):
+    """Falling back to a recorded configuration must still honour the opt-in label."""
+    main, fake_client = load_main(monkeypatch)
+    removals = []
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+    monkeypatch.setattr(
+        main, "process_stop_event", lambda host_override, alias: removals.append((host_override, alias))
+    )
+
+    fake_client.container = _remembering_container(
+        "abc123", "nginx", "nginx.lab.internal", remove_on_stop=False
+    )
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    _container_is_gone(fake_client)
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
+
+    assert removals == []
+    assert "Container not found" in caplog.text
+
+
+def test_a_missing_container_on_a_start_event_is_not_treated_as_a_stop(monkeypatch, caplog):
+    """A recorded alias is a fallback for stopping, never a reason to remove on start."""
+    main, fake_client = load_main(monkeypatch)
+    removals = []
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+    monkeypatch.setattr(
+        main, "process_stop_event", lambda host_override, alias: removals.append((host_override, alias))
+    )
+
+    fake_client.container = _remembering_container("abc123", "nginx", "nginx.lab.internal")
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    _container_is_gone(fake_client)
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    assert removals == []
+    assert "Container not found" in caplog.text
+
+
+def test_the_remembered_alias_table_is_bounded(monkeypatch):
+    """
+    Container IDs are never reused, so entries would otherwise accumulate for the
+    lifetime of the process. The oldest are dropped once the table is full.
+    """
+    main, fake_client = load_main(monkeypatch)
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+
+    overflow = main.KNOWN_ALIASES_MAX + 5
+    for index in range(overflow):
+        fake_client.container = _remembering_container(
+            f"id-{index}", f"svc{index}", f"svc{index}.lab.internal"
+        )
+        main.handle_container_event({"Actor": {"ID": f"id-{index}"}, "Action": "start"})
+
+    assert len(main.KNOWN_ALIASES) == main.KNOWN_ALIASES_MAX
+    assert "id-0" not in main.KNOWN_ALIASES
+    assert f"id-{overflow - 1}" in main.KNOWN_ALIASES
+
+
+def test_startup_scan_remembers_aliases_for_containers_it_did_not_see_start(monkeypatch):
+    """
+    A container already running when this service starts never produces a start event,
+    so the startup scan is the only chance to record it.
+    """
+    main, fake_client = load_main(monkeypatch)
+    fake_client.containers.list = lambda: [
+        _remembering_container("abc123", "nginx", "nginx.lab.internal")
+    ]
+    main.NAMESERVER = types.SimpleNamespace(
+        add_host_override_alias=lambda *_args, **_kwargs: True,
+        apply_changes=lambda: True,
+    )
+    main.add_aliases_on_startup()
+
+    removals = []
+    monkeypatch.setattr(
+        main, "process_stop_event", lambda host_override, alias: removals.append((host_override, alias))
+    )
+    _container_is_gone(fake_client)
+
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
+
+    assert removals == [("caddy.lab.internal", "nginx.lab.internal")]
