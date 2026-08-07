@@ -263,35 +263,44 @@ def test_requests_never_follow_redirects(monkeypatch):
     assert all(value is False for value in seen), seen
 
 
-def test_a_redirect_is_treated_as_a_failure_not_a_success(monkeypatch, caplog):
+def test_every_3xx_is_treated_as_a_failure_not_a_success(monkeypatch, caplog):
     """
-    Refusing to follow a redirect is not enough on its own.
+    Refusing to follow a redirect is not enough on its own, and neither is is_redirect.
 
-    raise_for_status() only raises for 4xx and 5xx, so a 302 would sail through as
-    success -- and a mutation would then set unapplied_changes and increment
-    change_count for a change that never reached pfSense, leaving the coalescer
-    retrying an apply for work that does not exist. A redirect must fail the request.
+    raise_for_status() only raises for 4xx and 5xx, so any 3xx would sail through as
+    success -- a mutation would set unapplied_changes and increment change_count for a
+    change that never reached pfSense, and the operator would read "added" while the
+    name does not resolve.
+
+    This is driven by real status codes rather than a flag, because requests' own
+    `is_redirect` is False unless the status is one of 301/302/303/307/308 AND a
+    Location header is present. A 302 whose Location a proxy stripped, a bare 304, or
+    a 300 all report is_redirect False -- so guarding on that attribute left exactly
+    the responses raise_for_status() also ignores. The earlier version of this test set
+    is_redirect=True on a fake and so asserted the branch, not the classification.
     """
     monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
 
-    class Redirect(FakeResponse):
-        def __init__(self):
-            super().__init__({})
-            self.status_code = 302
-            self.is_redirect = True
+    for status in (300, 301, 302, 303, 304, 305, 307, 308, 399):
+        class ThreeXX(FakeResponse):  # pylint: disable=cell-var-from-loop
+            def __init__(self):
+                super().__init__({})
+                self.status_code = status
 
-    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: Redirect())
+        monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: ThreeXX())
 
-    client = PFSense("pfsense.lab.internal", "secret-token")
-    client.get_all_host_overrides = lambda: [
-        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
-    ]
+        client = PFSense("pfsense.lab.internal", "secret-token")
+        client.get_all_host_overrides = lambda: [
+            {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+        ]
 
-    with caplog.at_level(logging.ERROR):
-        assert client.add_host_override_alias("caddy.lab.internal", "n.lab.internal") is False
+        with caplog.at_level(logging.ERROR):
+            added = client.add_host_override_alias("caddy.lab.internal", "n.lab.internal")
 
-    assert client.unapplied_changes is False
-    assert client.change_count == 0
+        assert added is False, status
+        assert client.unapplied_changes is False, status
+        assert client.change_count == 0, status
+
     assert "redirect" in caplog.text.lower()
 
 
@@ -345,6 +354,38 @@ def test_a_value_error_in_a_mutation_does_not_escape(monkeypatch, caplog):
     with caplog.at_level(logging.ERROR):
         # Must return False, not raise.
         assert client.apply_changes() is False
+
+
+def test_an_unrecognised_exception_carrying_the_token_still_does_not_log_it(monkeypatch, caplog):
+    """
+    The two named exception types are an allowlist, and allowlists go stale.
+
+    InvalidHeader and UnicodeEncodeError are suppressed by type, but they are not the
+    only exceptions that can embed a header value -- http.client raises a plain
+    ValueError('Invalid header value %r') too, and _request was widened to catch
+    ValueError without the suppression list widening with it. That path is unreachable
+    today only because requests validates first and more strictly.
+
+    So the last line of defence is not the type list: any message about to be logged
+    has the token removed from it first. This is a backstop with known limits -- it
+    matches the literal value, so a message that renders the token escaped or in
+    pieces would still get through -- not a replacement for the startup gate.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise ValueError("Invalid header value 'SUPERSECRETTOKEN'")
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "SUPERSECRETTOKEN")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "SUPERSECRETTOKEN" not in caplog.text
+    # The rest of the message must survive, or the backstop destroys the diagnostic.
+    assert "Invalid header value" in caplog.text
 
 
 def test_a_token_with_a_trailing_newline_never_reaches_the_log(monkeypatch, caplog):
