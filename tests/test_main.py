@@ -1196,6 +1196,26 @@ def test_unusable_coalescing_config_falls_back_to_defaults(monkeypatch, caplog):
     assert "non-positive" in caplog.text
 
 
+def test_non_finite_coalescing_config_falls_back_to_defaults(monkeypatch, caplog):
+    """
+    nan and inf parse as floats and are not <= 0, so they slipped through as valid.
+
+    They are not merely odd values, they disable the flush logic: every comparison
+    against nan is false, and nothing ever exceeds inf. With APPLY_QUIET_SECONDS=nan
+    and APPLY_MAX_WAIT_SECONDS=inf together, _flush_reason returns None forever, so
+    staged changes are never applied by a window tick -- only by the shutdown flush,
+    and only if the process is stopped cleanly.
+    """
+    main, _fake_client = load_main(monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        for value in ("nan", "inf", "-inf", "NaN", "Infinity"):
+            monkeypatch.setenv("SOME_WINDOW", value)
+            assert main.get_positive_float_env("SOME_WINDOW", 10.0) == 10.0
+
+    assert "not a finite number" in caplog.text
+
+
 def test_shutdown_survives_a_failing_flush(monkeypatch, caplog):
     main, fake_client = load_main(monkeypatch)
 

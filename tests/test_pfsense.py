@@ -1162,6 +1162,54 @@ def test_a_landed_mutation_marks_unapplied_changes(monkeypatch):
     assert client.unapplied_changes is True
 
 
+def test_a_landed_mutation_increments_change_count(monkeypatch):
+    """
+    change_count must move whenever a mutation lands, exactly once per mutation.
+
+    This is the production half of the contract main's coalescer depends on: it compares
+    change_count across a call to tell a real mutation from a no-op. unapplied_changes
+    cannot answer that, because it saturates at True for the length of a burst.
+
+    Without this test, deleting the increment leaves the whole suite green while
+    silently reverting two fixes at once -- every event would look like a no-op, so
+    PENDING_CHANGES would never rise, a compose up would go back to one unbound reload
+    per container, and a mutation that lands while its apply fails would be stranded
+    with nothing pending to retry it.
+    """
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get(applied=False))
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    assert client.change_count == 0
+    client.add_host_override_alias("caddy.lab.internal", "nginx.lab.internal", apply=False)
+    assert client.change_count == 1
+    client.add_host_override_alias("caddy.lab.internal", "second.lab.internal", apply=False)
+    assert client.change_count == 2
+
+
+def test_a_rejected_mutation_does_not_move_change_count(monkeypatch):
+    """
+    The other half: a mutation that never reaches pfSense must not look like a change.
+
+    Here the parent host override does not exist, so the method returns False before
+    issuing any request. Counting that would make the coalescer treat a no-op as staged
+    work -- the exact defect that inflated the pending count during a burst.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: []
+
+    assert client.add_host_override_alias("missing.lab.internal", "nginx.lab.internal") is False
+    assert client.change_count == 0
+    assert client.unapplied_changes is False
+
+
 def test_a_confirmed_apply_clears_unapplied_changes(monkeypatch):
     monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
     monkeypatch.setattr("pfsense.requests.get", applied_status_get(applied=True))
