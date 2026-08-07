@@ -163,6 +163,8 @@ With `apply=False`, a `True` return means **staged in the pfSense configuration 
 
 For the same reason, **a failed flush keeps its changes pending**. `flush_pending_changes()` calls `_defer_retry()` rather than `_record_applied()` when the apply fails, so a later tick or the shutdown flush retries. `_defer_retry()` pushes the timers out a full quiet window so a pfSense outage is not retried on every two-second window tick.
 
+**The startup scan obeys the same rule, and for a while it did not.** When its single `apply_changes()` fails, `add_aliases_on_startup` calls `_record_staged(staged)` to hand the work to the coalescer. It used to only log. That left `PENDING_CHANGES` at `0` while `unapplied_changes` was `True`, and since `flush_pending_changes()` returns at its guard when nothing is pending, neither a window tick nor the shutdown flush ever retried — the aliases sat in `config.xml` with unbound never reloaded, and on an idle host no name resolved until something unrelated happened to trigger an apply. `test_a_failed_startup_apply_stays_pending_and_is_retried` pins both halves: that the count is recorded, and that a later flush actually clears it. Note this is the *whole* reason `_record_staged` takes a count — every other caller passes one.
+
 ### API responses are untrusted input
 
 `get_all_host_overrides()` validates the payload shape — it returns `[]` for a non-list `data` and drops non-dict entries — and every accessor uses `.get()` rather than indexing. A well-formed 200 with an unexpected body previously raised `KeyError`/`TypeError` straight out of this module, which `main()` does not catch, exiting the service instead of logging and carrying on. An API schema change must degrade to a warning, never a crash loop.

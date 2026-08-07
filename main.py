@@ -159,6 +159,13 @@ def add_aliases_on_startup():
 
     logger.info(f"Applying {staged} staged alias(es) in a single reload...")
     if not NAMESERVER.apply_changes():
+        # Hand the staged changes to the coalescer so a later window tick or the
+        # shutdown flush retries the apply. Logging alone left PENDING_CHANGES at 0, and
+        # flush_pending_changes() returns at its guard when nothing is pending -- so on
+        # an idle host nothing ever retried, and the aliases sat in the configuration
+        # with unbound never reloaded. This is the same rule the event path follows:
+        # what pfSense actually holds decides, not the return value.
+        _record_staged(staged)
         logger.error(
             f"{staged} alias(es) are staged in the pfSense configuration but were not "
             "applied. They will take effect on the next successful apply."
@@ -313,10 +320,10 @@ def should_apply_immediately():
         return False
     return LAST_APPLY_AT is None or time.monotonic() - LAST_APPLY_AT >= APPLY_QUIET_SECONDS
 
-def _record_staged():
-    """Note that a change is staged in pfSense but not yet applied."""
+def _record_staged(count=1):
+    """Note that `count` changes are staged in pfSense but not yet applied."""
     global PENDING_CHANGES, PENDING_SINCE, LAST_CHANGE_AT  # pylint: disable=global-statement
-    PENDING_CHANGES += 1
+    PENDING_CHANGES += count
     LAST_CHANGE_AT = time.monotonic()
     if PENDING_SINCE is None:
         PENDING_SINCE = LAST_CHANGE_AT
