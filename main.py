@@ -7,6 +7,7 @@ DNS aliases in pfSense based on labels defined in the container configuration.
 
 import os
 import sys
+import math
 import time
 import signal
 import logging
@@ -50,6 +51,15 @@ def get_positive_float_env(var_name, default):
         value = float(raw)
     except ValueError:
         logger.warning(f"Ignoring invalid {var_name}='{raw}'; using {default}.")
+        return default
+
+    if not math.isfinite(value):
+        # float() accepts "nan" and "inf", and neither is caught by the <= 0 check
+        # below: nan compares false against everything and nothing exceeds inf. Left
+        # through, they disable flushing rather than merely setting an odd window --
+        # _flush_reason() would return None forever, so staged changes would go live
+        # only on a clean shutdown.
+        logger.warning(f"Ignoring {var_name}='{raw}'; not a finite number. Using {default}.")
         return default
 
     if value <= 0:
