@@ -380,8 +380,56 @@ class PFSense:
             None
         )
 
+    def _mutate_alias(self, method, context, data, apply_now):
+        """
+        Sends a mutating request to the alias endpoint, then applies it unless staging.
+
+        Both public mutators share this shape, and the duplication used to be copied
+        between them. Callers still log their own outcome, because the wording differs
+        and the staged wording matters: an operator reading "removed" while the name
+        still resolves is worse than no message at all.
+
+        The parameter is `apply_now` rather than `apply` only to avoid shadowing the
+        builtin in a method that does not need the public signature.
+
+        :param method: The requests function to call, e.g. requests.post.
+        :param context: Name used in log messages, normally the calling method's.
+        :param data: The JSON body for the request.
+        :param apply_now: Apply the change immediately rather than leaving it staged.
+        :return: True if the change landed in the pfSense configuration and, when
+            apply_now is True, was confirmed live.
+        """
+        try:
+            response = self._request(
+                method,
+                context,
+                url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
+                headers=self._headers(),
+                verify=self.verify_ssl,
+                timeout=10,
+                json=data
+            )
+            if response is None:
+                return False
+            response.raise_for_status()
+
+        except (requests.RequestException, OSError) as e:
+            self._handle_api_error(e, context)
+            return False
+
+        # The configuration has now changed whether or not the apply below succeeds.
+        # Recording that is what stops a failed apply from stranding the change with
+        # nothing tracking it -- main._record_change_outcome() reads this flag, not
+        # the boolean returned here.
+        self.unapplied_changes = True
+
+        if apply_now and not self.apply_changes():
+            return False
+
+        return True
+
     def add_host_override_alias(self, host_override_fqdn, alias_fqdn, alias_descr="", apply=True):
-        # pylint: disable=too-many-return-statements,redefined-builtin
+        # pylint: disable=redefined-builtin
         """
         Adds an alias to an existing host override in pfSense.
 
@@ -435,33 +483,10 @@ class PFSense:
             'domain': f'{alias_domain}',
             'descr': cleaned_descr
         }
-        try:
-            # Create new alias
-            response = self._request(
-                requests.post,
-                "add_host_override_alias",
-                url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
-                headers=self._headers(),
-                verify=self.verify_ssl,
-                timeout=10,
-                json=data
-            )
-            if response is None:
-                return False
-            response.raise_for_status()
-
-        except (requests.RequestException, OSError) as e:
-            self._handle_api_error(e, "add_host_override_alias")
+        if not self._mutate_alias(requests.post, "add_host_override_alias", data, apply):
             return False
 
-        # The alias now exists in the pfSense configuration whether or not the apply
-        # below succeeds. Recording that is what stops a failed apply from stranding
-        # the change with nothing tracking it.
-        self.unapplied_changes = True
-
         if apply:
-            if not self.apply_changes():
-                return False
             logger.info(
                 f"Alias {sanitize_for_log(alias_fqdn)} added to host override "
                 f"{sanitize_for_log(host_override_fqdn)}."
@@ -475,7 +500,7 @@ class PFSense:
         return True
 
     def del_host_override_alias(self, host_override_fqdn, alias_fqdn, apply=True):
-        # pylint: disable=redefined-builtin,too-many-return-statements
+        # pylint: disable=redefined-builtin
         """
         Removes an alias from an existing host override in pfSense.
 
@@ -512,30 +537,10 @@ class PFSense:
             'id': f'{alias_id}',
         }
 
-        try:
-            # Remove alias
-            response = self._request(
-                requests.delete,
-                "del_host_override_alias",
-                url=f'https://{self.pfsense_host}/api/v2/services/dns_resolver/host_override/alias',
-                headers=self._headers(),
-                verify=self.verify_ssl,
-                timeout=10,
-                json=data
-            )
-            if response is None:
-                return False
-            response.raise_for_status()
-
-        except (requests.RequestException, OSError) as e:
-            self._handle_api_error(e, "del_host_override_alias")
+        if not self._mutate_alias(requests.delete, "del_host_override_alias", data, apply):
             return False
 
-        self.unapplied_changes = True
-
         if apply:
-            if not self.apply_changes():
-                return False
             logger.info(
                 f"Alias {sanitize_for_log(alias_fqdn)} removed from host override "
                 f"{sanitize_for_log(host_override_fqdn)}."
