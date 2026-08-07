@@ -822,6 +822,45 @@ def test_startup_scan_reports_staged_aliases_when_the_apply_fails(monkeypatch, c
     assert "next successful apply" in caplog.text
 
 
+def test_a_failed_startup_apply_stays_pending_and_is_retried(monkeypatch):
+    """
+    A failed startup apply must leave the coalescer holding the work.
+
+    The event path already does this -- a mutation can land while its apply fails, and
+    unapplied_changes rather than the return value is what says so. The startup scan
+    only logged. PENDING_CHANGES stayed 0, and flush_pending_changes() returns
+    immediately when nothing is pending, so neither a window tick nor the shutdown
+    flush ever retried: the aliases sat in config.xml with unbound never reloaded, and
+    on an idle host no name resolved until something unrelated happened to trigger an
+    apply.
+    """
+    main, fake_client = load_main(monkeypatch)
+    staged = []
+    applies = []
+    fake_client.containers.list = lambda: [
+        _labeled_container("svc0", "svc0.lab.internal"),
+        _labeled_container("svc1", "svc1.lab.internal"),
+    ]
+    nameserver = _recording_nameserver(staged, applies, apply_result=False)
+    main.NAMESERVER = nameserver
+
+    main.add_aliases_on_startup()
+
+    assert len(staged) == 2
+    assert applies == ["apply"]
+    # The failure is tracked, not just logged.
+    assert main.PENDING_CHANGES == 2
+    assert main.PENDING_SINCE is not None
+
+    # A later flush must actually retry it. Without the fix there is nothing to retry,
+    # because PENDING_CHANGES is 0 and flush_pending_changes() returns at its guard.
+    nameserver.apply_result = True
+    main.flush_pending_changes(force=True)
+
+    assert applies == ["apply", "apply"]
+    assert main.PENDING_CHANGES == 0
+
+
 # --- Coalescing: a burst costs one reload, a lone start stays fast -------------
 
 

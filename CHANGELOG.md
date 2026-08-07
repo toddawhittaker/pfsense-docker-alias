@@ -88,7 +88,9 @@ also blocks removing it.
 - **A failed apply no longer strands changes.** A change that reached the pfSense
   configuration while its apply failed used to be forgotten, so nothing retried it and
   the alias never went live. Pending changes are now retried on a later event or at
-  shutdown.
+  shutdown. This applies to the startup scan too: with `ADD_ALIASES_ON_STARTUP=true`,
+  a failed startup apply used to leave every alias staged in the configuration with the
+  resolver never reloaded, and nothing would retry on an idle host.
 - **Applies are confirmed rather than assumed.** pfSense reloads asynchronously, so
   the request returns before the reload finishes. The service now polls until pfSense
   reports the change applied, and reports a failure if it never does.
