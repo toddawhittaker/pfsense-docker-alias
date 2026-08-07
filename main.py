@@ -89,6 +89,20 @@ if any(not character.isprintable() for character in PFSENSE_API_TOKEN):
         "line break. Check how the value is being set. It is not logged."
     )
     sys.exit(1)
+try:
+    # isprintable() is not the condition the transport actually imposes. HTTP header
+    # values are encoded as latin-1, so a printable character outside that range -- a
+    # euro sign, a smart quote pasted from a web page -- clears the check above and
+    # then fails deep in http.client with a message naming a character OF THE TOKEN
+    # and its index. Rejecting it here keeps that out of the log entirely.
+    PFSENSE_API_TOKEN.encode("latin-1")
+except UnicodeEncodeError:
+    logger.critical(
+        "PFSENSE_API_TOKEN contains characters that cannot be sent in an HTTP header. "
+        "API tokens are ASCII; check for a character pasted from formatted text. "
+        "It is not logged."
+    )
+    sys.exit(1)
 PFSENSE_VERIFY_SSL = os.getenv("PFSENSE_VERIFY_SSL", "true").lower() != "false"
 PFSENSE_CA_BUNDLE = os.getenv("PFSENSE_CA_BUNDLE")
 if PFSENSE_CA_BUNDLE and not os.access(PFSENSE_CA_BUNDLE, os.R_OK):

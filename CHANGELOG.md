@@ -110,6 +110,12 @@ also blocks removing it.
   API call. Surrounding whitespace is now trimmed at startup, so those tokens simply
   work; anything still malformed exits at startup naming the variable but never the
   value; and that class of error is never logged with its message.
+- **Redirects are no longer followed, and a redirected call fails.** `requests` strips
+  only the `Authorization` header across a cross-host redirect, so this service's
+  `X-API-Key` was being re-sent — a redirect from the firewall's web tier could hand a
+  live API token to another host, including over plain HTTP, even with certificate
+  verification enabled. pfSense's API does not redirect, so a redirect is now treated
+  as a misconfiguration and the call is abandoned.
 - **The service survives a SIGTERM with work in flight**, flushing staged changes
   before exit.
 

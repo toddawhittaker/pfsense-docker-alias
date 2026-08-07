@@ -521,6 +521,28 @@ def test_a_token_with_an_embedded_line_break_exits_without_logging_it(monkeypatc
     assert "non-printable" in caplog.text
 
 
+def test_a_token_with_a_non_latin1_character_exits_without_logging_it(monkeypatch, caplog):
+    """
+    isprintable() is not the condition the HTTP transport imposes.
+
+    Header values are encoded as latin-1, so a printable character outside that range
+    -- a euro sign, a smart quote pasted from formatted text -- passes the printability
+    check and then fails inside http.client with a message naming a character OF THE
+    TOKEN and its exact index. Rejecting it at startup keeps that out of the log.
+    """
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            _load_main_with_token(monkeypatch, "SUPERSECRET€TOKEN")
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("import did not exit")
+
+    assert "PFSENSE_API_TOKEN" in caplog.text
+    assert "SUPERSECRET" not in caplog.text
+    assert "€" not in caplog.text
+
+
 def test_cleanup_closes_client_and_exits_zero(monkeypatch):
     main, fake_client = load_main(monkeypatch)
 
