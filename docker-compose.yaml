@@ -6,35 +6,41 @@ services:
     # The name of the container for easier identification
     container_name: pfsense-docker-alias
 
+    # Every setting comes from your environment: copy .env.example to .env and
+    # fill it in, or export the variables in your shell. Values are read from
+    # both, with the shell winning. Defaults below match the application's own,
+    # so an unset optional variable behaves exactly as if it were absent.
+    #
+    # Do NOT hardcode values here. A literal set in this block silently wins
+    # over the same name in .env, which makes a filled-in .env look ignored.
     environment:
-      # REQUIRED environment variables
-      # The fully qualified domain name of your pfSense instance
-      PFSENSE_HOSTNAME: "pfsense.lab.internal"
-      
-      # API token for authenticating with pfSense. Set this in your shell or .env file.
-      PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN}"
-      
-      # OPTIONAL environment variables
-      # TLS certificate verification is ON by default. Set this to "false" only
-      # if you cannot validate your pfSense certificate -- doing so exposes the
-      # API token to anyone able to intercept the connection.
-      # PFSENSE_VERIFY_SSL: "true"
-      #
-      # Path inside the container to a custom CA bundle for pfSense TLS validation
-      # PFSENSE_CA_BUNDLE: "/etc/ssl/certs/pfsense-ca.pem"
-      #
-      # Uncomment to scan and add aliases for existing containers on startup
-      # ADD_ALIASES_ON_STARTUP: "true"
-      #
+      # REQUIRED. Compose refuses to start and names the variable if either is
+      # unset, rather than starting a container that cannot reach pfSense.
+      PFSENSE_HOSTNAME: "${PFSENSE_HOSTNAME:?set PFSENSE_HOSTNAME in .env}"
+      PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN:?set PFSENSE_API_TOKEN in .env}"
+
+      # OPTIONAL. TLS certificate verification is ON by default. Set
+      # PFSENSE_VERIFY_SSL=false only if you cannot validate your pfSense
+      # certificate -- that exposes the API token above to anyone able to
+      # intercept the connection. Prefer PFSENSE_CA_BUNDLE.
+      PFSENSE_VERIFY_SSL: "${PFSENSE_VERIFY_SSL:-true}"
+
+      # Path inside the container to a CA bundle for pfSense TLS validation.
+      # Mount the file too -- see the volumes section below.
+      PFSENSE_CA_BUNDLE: "${PFSENSE_CA_BUNDLE:-}"
+
+      # Scan already-running containers at startup and add their aliases.
+      ADD_ALIASES_ON_STARTUP: "${ADD_ALIASES_ON_STARTUP:-false}"
+
       # Seconds without a new container event before staged DNS changes are
       # applied together. A burst of container starts costs one reload, not one
       # reload per alias.
-      # APPLY_QUIET_SECONDS: "10"
-      #
+      APPLY_QUIET_SECONDS: "${APPLY_QUIET_SECONDS:-10}"
+
       # Upper bound on how long staged changes wait, so continuous container
       # churn cannot delay them indefinitely.
-      # APPLY_MAX_WAIT_SECONDS: "60"
-      
+      APPLY_MAX_WAIT_SECONDS: "${APPLY_MAX_WAIT_SECONDS:-60}"
+
     volumes:
       # Mount the Docker socket for listening to container events
       - /var/run/docker.sock:/var/run/docker.sock

@@ -1,5 +1,8 @@
 README.md
 CONTRIBUTING.md
+CHANGELOG.md
+.env
+.env.*
 test-env/
 LICENSE
 .git/

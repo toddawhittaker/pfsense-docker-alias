@@ -67,6 +67,10 @@ also blocks removing it.
   failing on every request.
 - `APPLY_QUIET_SECONDS` (default `10`) and `APPLY_MAX_WAIT_SECONDS` (default `60`) to
   tune how container-event bursts are batched.
+- `.env.example`, a documented template for every supported setting. Copy it to `.env`
+  and fill it in; `docker compose` reads `.env` automatically. `.env` is now gitignored
+  as well — the documentation has always told you to keep `PFSENSE_API_TOKEN` there,
+  but nothing previously stopped that file from being committed.
 
 ### Fixed
 

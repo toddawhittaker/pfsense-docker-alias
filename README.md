@@ -95,22 +95,33 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
      docker pull ghcr.io/toddawhittaker/pfsense-docker-alias:latest
      ```
 
-2. **Prepare `docker-compose.yaml`**:
-   - Create or modify a `docker-compose.yaml` file for your setup. Here’s an example:
+2. **Create your `.env`**:
+   - Copy [`.env.example`](.env.example) and fill it in. At minimum set `PFSENSE_HOSTNAME` and `PFSENSE_API_TOKEN`; every other setting has a working default.
+     ```bash
+     cp .env.example .env
+     ```
+   - `docker compose` reads `.env` automatically from the directory it runs in, and `.env` is gitignored so your token cannot be committed by accident.
+
+3. **Prepare `docker-compose.yaml`**:
+   - Create or modify a `docker-compose.yaml` file for your setup. Here’s an example — this matches the [`docker-compose.yaml`](docker-compose.yaml) in the repo apart from the `image:` line:
      ```yaml
      services:
        pfsense-docker-alias:
          image: ghcr.io/toddawhittaker/pfsense-docker-alias:latest
          container_name: pfsense-docker-alias
+         # Every setting comes from .env or your shell, with the shell winning.
+         # Do not hardcode values here: a literal silently wins over the same
+         # name in .env, which makes a filled-in .env look ignored.
          environment:
-           PFSENSE_HOSTNAME: "pfsense.lab.internal"
-           PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN}"
-           # Keep TLS verification enabled by default. For self-signed certs,
-           # mount a CA bundle and set PFSENSE_CA_BUNDLE to its container path.
-           # PFSENSE_VERIFY_SSL: "true"
-           # PFSENSE_CA_BUNDLE: "/etc/ssl/certs/pfsense-ca.pem"
-           # Uncomment to enable scanning for aliases on startup
-           # ADD_ALIASES_ON_STARTUP: "true"
+           # Required. Compose refuses to start and names the variable if unset.
+           PFSENSE_HOSTNAME: "${PFSENSE_HOSTNAME:?set PFSENSE_HOSTNAME in .env}"
+           PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN:?set PFSENSE_API_TOKEN in .env}"
+           # Optional. These defaults match the application's own.
+           PFSENSE_VERIFY_SSL: "${PFSENSE_VERIFY_SSL:-true}"
+           PFSENSE_CA_BUNDLE: "${PFSENSE_CA_BUNDLE:-}"
+           ADD_ALIASES_ON_STARTUP: "${ADD_ALIASES_ON_STARTUP:-false}"
+           APPLY_QUIET_SECONDS: "${APPLY_QUIET_SECONDS:-10}"
+           APPLY_MAX_WAIT_SECONDS: "${APPLY_MAX_WAIT_SECONDS:-60}"
          volumes:
            - /var/run/docker.sock:/var/run/docker.sock
            # Uncomment when using PFSENSE_CA_BUNDLE
@@ -118,24 +129,37 @@ Do you trust me? Okay, feel free to use the pre-built image that I'm running in 
          restart: unless-stopped
      ```
 
-3. **Start the Service**:
+4. **Start the Service**:
    - Run the following command to start the container:
      ```bash
      docker compose up -d
      ```
 
-4. **Verify Logs**:
+5. **Verify Logs**:
    - Check the logs to confirm the container is running and communicating with pfSense:
      ```bash
      docker compose logs -f
      ```
 
-5. **Stop the Service** (Optional):
+6. **Stop the Service** (Optional):
    - If you need to stop the container:
      ```bash
      docker compose down
      ```
 #### Using `docker run`
+
+Unlike `docker compose`, `docker run` does **not** read `.env` on its own — pass it explicitly with `--env-file`:
+
+```bash
+docker run \
+  --name pfsense-docker-alias \
+  --env-file .env \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ghcr.io/toddawhittaker/pfsense-docker-alias:latest
+```
+
+Or set the variables individually. Only the first two are required; the rest have working defaults:
+
 ```bash
 docker run \
   --name pfsense-docker-alias \
@@ -149,7 +173,7 @@ docker run \
 
 ### Notes 📝
 
-- Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`.
+- Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`. Copy [`.env.example`](.env.example) to `.env` and fill it in — `docker compose` reads `.env` automatically, and `.env` is gitignored so your token cannot be committed by accident.
 - Ensure the required environment variables (`PFSENSE_HOSTNAME`, `PFSENSE_API_TOKEN`) are correctly set.
 - If using `ADD_ALIASES_ON_STARTUP`, ensure all currently running containers are labeled correctly before starting the service. Startup sync is additive and does not prune stale aliases.
 - A single container start applies right away. When several containers start at once — a `docker compose up`, or a startup scan — the changes are batched and applied in one DNS resolver reload rather than one per alias. A lone alias is therefore live in seconds, while a burst of twenty costs two reloads instead of twenty. Tune with `APPLY_QUIET_SECONDS` if your services start staggered over a longer period.
