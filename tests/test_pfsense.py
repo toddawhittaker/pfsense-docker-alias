@@ -163,6 +163,65 @@ def test_http_error_logs_status_without_response_body(monkeypatch, caplog):
     assert "sensitive response body" not in caplog.text
 
 
+def test_a_tls_verification_failure_names_the_settings_that_fix_it(monkeypatch, caplog):
+    """
+    A certificate failure must point at the two settings that resolve it.
+
+    Verification defaults to on, which is a change from this service's own earlier
+    behaviour of never verifying. requests reports the cause accurately -- "certificate
+    verify failed: self-signed certificate" -- but names nothing an operator can set,
+    and someone upgrading has no reason to know PFSENSE_VERIFY_SSL exists, because in
+    the version they are upgrading from it did not.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise requests.exceptions.SSLError(
+            "certificate verify failed: self-signed certificate"
+        )
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    hints = [m for m in log_messages(caplog) if "PFSENSE_CA_BUNDLE" in m]
+    assert len(hints) == 1
+    assert "PFSENSE_VERIFY_SSL" in hints[0]
+    # The underlying cause must survive alongside the hint; a hint that replaced the
+    # real error would send someone to the wrong setting when the failure is expiry
+    # or a hostname mismatch rather than an untrusted issuer.
+    assert "certificate verify failed" in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+def test_an_ordinary_connection_error_does_not_suggest_disabling_tls(monkeypatch, caplog):
+    """
+    The hint is for certificate failures only, and that boundary is the point.
+
+    requests.exceptions.SSLError subclasses ConnectionError, so a check written in the
+    wrong order would fire this hint for every unplugged cable and unreachable host.
+    Advice to consider turning off certificate validation, printed whenever the network
+    hiccups, is how a fail-secure default gets switched off for an unrelated reason.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "PFSENSE_CA_BUNDLE" not in caplog.text
+    assert "PFSENSE_VERIFY_SSL" not in caplog.text
+
+
 def test_get_all_host_overrides_returns_empty_list_on_network_errors(monkeypatch):
     def fake_get(**_kwargs):
         raise requests.ConnectionError("connection failed")

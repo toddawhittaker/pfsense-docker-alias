@@ -304,6 +304,20 @@ class PFSense:
         logger.error(f"API call failed during '{context}': {sanitize_for_log(error)}")
         if isinstance(error, requests.HTTPError):
             logger.error(f"HTTP Status Code: {error.response.status_code}")
+        if isinstance(error, requests.exceptions.SSLError):
+            # requests reports the cause accurately but names nothing an operator can
+            # set. Verification defaults to on, which this service did not always do,
+            # so someone upgrading has no reason to know these settings exist.
+            #
+            # Deliberately SSLError and not its ConnectionError parent: advice to
+            # consider switching verification off must not appear every time the host
+            # is simply unreachable. A test pins that boundary.
+            logger.error(
+                "TLS certificate verification failed. Mount a CA bundle and set "
+                "PFSENSE_CA_BUNDLE to its path inside the container, or set "
+                "PFSENSE_VERIFY_SSL=false to skip verification entirely, which "
+                "exposes the API token to anyone able to intercept the connection."
+            )
 
     def get_all_host_overrides(self):
         """Returns all the host overrides defined in pfSense"""

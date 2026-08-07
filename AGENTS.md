@@ -204,6 +204,8 @@ This no-op has a cost, and it is actionable rather than merely a lament: because
 
 Never log API tokens, secrets, full authorization headers, sensitive environment values, or API response bodies. `_handle_api_error` logs the exception and status code but not `response.text`, and `test_http_error_logs_status_without_response_body` enforces it.
 
+`_handle_api_error` also logs one extra line for a `requests.exceptions.SSLError`, naming `PFSENSE_CA_BUNDLE` and `PFSENSE_VERIFY_SSL`. This exists because verification defaults to on while this service's own `v0.1.x` never verified at all, so an upgrading operator meets a certificate error naming a setting they have no reason to know exists. Two properties are deliberate. The hint is **added to** the underlying error, never a replacement for it — the cause matters when the failure is expiry or a hostname mismatch rather than an untrusted issuer. And it keys on `SSLError` specifically, **not** its `ConnectionError` parent: advice to consider switching verification off must not print every time the firewall is briefly unreachable, which is how a fail-secure default gets disabled for an unrelated reason. `test_an_ordinary_connection_error_does_not_suggest_disabling_tls` pins that boundary; widening the check to `ConnectionError` fails it.
+
 ## Branching and pull requests
 
 `main` is protected: it takes no direct pushes. All work lands through a pull request that squash-merges into one commit, so `main` stays linear.

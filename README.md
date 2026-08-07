@@ -43,8 +43,8 @@ With **pfSense Docker Alias**, the **last step** is automated! Simply label your
 - **Startup Alias Sync**: Optionally scans currently running containers and ensures aliases are present in pfSense.
 - **Highly Configurable**: Flexible environment variables and Docker labels.
 - **Lightweight**: Built on an Alpine-based Python image for minimal resource usage.
-- **Secure**: Requires API key-based authentication for pfSense.
-- **Flexible**: Works with self-signed certificates for pfSense.
+- **Secure**: Requires API key-based authentication for pfSense, and verifies the pfSense certificate by default.
+- **Flexible**: Works with self-signed certificates for pfSense — mount your CA bundle and set `PFSENSE_CA_BUNDLE`, or turn verification off with `PFSENSE_VERIFY_SSL=false` if you cannot.
 
 ## Requirements 🛠️
 
@@ -53,6 +53,35 @@ With **pfSense Docker Alias**, the **last step** is automated! Simply label your
   Follow the installation instructions here: [Install and Configure the API](https://pfrest.org/INSTALL_AND_CONFIG/)
 - An API key for the pfSense REST API.  
   Generate an API key by following:  [Authentication and Authorization](https://pfrest.org/AUTHENTICATION_AND_AUTHORIZATION/)
+
+## Upgrading from v0.1.x ⬆️
+
+**v0.2.0 verifies the pfSense TLS certificate by default.** v0.1.2 and earlier disabled verification on every request, with no way to turn it on. Most pfSense installations use a self-signed certificate, so if yours does, every API call will fail after upgrading until you do one of two things.
+
+Note that this reaches you automatically if you pull the `latest` tag.
+
+The failure is not silent — the service logs the cause and then names both settings:
+
+```
+ERROR - API call failed during 'get_all_host_overrides': ... certificate verify failed: self-signed certificate
+ERROR - TLS certificate verification failed. Mount a CA bundle and set PFSENSE_CA_BUNDLE
+        to its path inside the container, or set PFSENSE_VERIFY_SSL=false to skip
+        verification entirely, which exposes the API token to anyone able to intercept
+        the connection.
+```
+
+**Recommended** — keep verification on by exporting your pfSense CA certificate, mounting it, and pointing `PFSENSE_CA_BUNDLE` at it:
+
+```yaml
+environment:
+  PFSENSE_CA_BUNDLE: "/etc/ssl/certs/pfsense-ca.pem"
+volumes:
+  - ./pfsense-ca.pem:/etc/ssl/certs/pfsense-ca.pem:ro
+```
+
+**Otherwise** — set `PFSENSE_VERIFY_SSL=false` to restore the old behaviour. Understand the trade first: this service authenticates with a pfSense API token, so anyone able to intercept the connection can present any certificate and collect that token.
+
+There is one other breaking change — alias names are now capped at 253 characters, and an over-long alias left behind by an earlier version will stop your DNS resolver until you delete it in the webGUI. See [CHANGELOG.md](CHANGELOG.md) for that and for everything else in this release.
 
 ## Installation Guide 🚀
 
@@ -202,7 +231,8 @@ services:
 
 - Replace `caddy.lab.internal` with the fully qualified hostname of your reverse proxy. Make sure it exists as a host override in pfSense.
 - Replace `nginx.lab.internal` with the fully qualified hostname of the service you're deploying.
-- An alias longer than 253 characters is rejected with a warning and cannot be resolved by DNS anyway. If one already exists in pfSense from an earlier version of this service, remove it in the webGUI — this service will decline to touch it.
+- An alias longer than 253 characters (RFC 1035's limit) is rejected with a warning. No DNS client could resolve such a name anyway, so nothing is lost by refusing it.
+- **If an over-long alias already exists in pfSense from an earlier version of this service, delete it in the webGUI now.** It is not harmless leftover configuration: it makes `unbound-checkconf` fail, so the DNS resolver stops on its next reload and every name on the firewall stops resolving, not just that one. This service cannot clean it up for you — the same length rule that blocks creating such an alias also blocks removing it.
 - `pfsense.dns.remove_on_stop=true` works with `docker run --rm`. This service records a container's alias configuration when it starts, so a container Docker has already deleted by the time its stop event arrives still has its alias removed. Containers already running before this service starts are only recorded when `ADD_ALIASES_ON_STARTUP` is enabled; without it, a pre-existing `--rm` container that stops may leave its alias behind.
 
 ## Contributing 💻
