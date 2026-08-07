@@ -564,6 +564,62 @@ def test_a_token_with_a_non_latin1_character_exits_without_logging_it(monkeypatc
     assert "€" not in caplog.text
 
 
+def _capture_client(monkeypatch, main):
+    """Record the arguments main() passes to PFSense, and run one empty event loop."""
+    captured = {}
+
+    class Recorder:
+        def __init__(self, host, token, verify_ssl=True, ca_bundle=None):
+            captured.update(
+                host=host, token=token, verify_ssl=verify_ssl, ca_bundle=ca_bundle
+            )
+            self.unapplied_changes = False
+            self.change_count = 0
+
+    monkeypatch.setattr(main.pfsense, "PFSense", Recorder)
+    monkeypatch.setattr(main, "iter_events", lambda: iter(()))
+    main.main()
+    return captured
+
+
+def test_main_wires_the_client_from_the_environment(monkeypatch):
+    """
+    The one place the operator's settings become the client's settings, and it was
+    observed by nothing -- the string "PFSense(" did not appear in this file at all.
+
+    Hardcoding verify_ssl=False here left all 173 tests green while disabling
+    certificate verification for the DEFAULT deployment: the operator sets only
+    PFSENSE_HOSTNAME and PFSENSE_API_TOKEN, PFSENSE_VERIFY_SSL correctly evaluates to
+    True, and every request still carries the API token over an unverified connection.
+
+    Passing ca_bundle=None survived too, silently ignoring a mounted CA bundle. So did
+    swapping the two positional arguments, which puts the token in every URL -- and
+    therefore into DNS queries and TLS SNI. A positional reorder during a refactor is
+    exactly how that happens.
+    """
+    main, _fake_client = load_main(monkeypatch)
+
+    captured = _capture_client(monkeypatch, main)
+
+    assert captured["host"] == "pfsense.lab.internal"
+    assert captured["token"] == "test-token"
+    assert captured["verify_ssl"] is True
+    assert captured["ca_bundle"] is None
+
+
+def test_main_passes_the_ca_bundle_through(monkeypatch, tmp_path):
+    """The bundle must reach the client; main must not drop it."""
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-- not a real certificate --\n")
+    main, _fake_client = load_main(monkeypatch, verify_ssl="false", ca_bundle=str(bundle))
+
+    captured = _capture_client(monkeypatch, main)
+
+    assert captured["ca_bundle"] == str(bundle)
+    assert captured["verify_ssl"] is False
+    assert captured["host"] == "pfsense.lab.internal"
+
+
 def test_cleanup_closes_client_and_exits_zero(monkeypatch):
     main, fake_client = load_main(monkeypatch)
 
@@ -1210,12 +1266,20 @@ def test_a_failed_flush_defers_the_next_attempt(monkeypatch):
     inside the quiet window must not retry, and one after it must.
     """
     clock = FakeClock()
-    monkeypatch.setattr("main.time.monotonic", clock)
+    # Target the stdlib module, NOT "main.time.monotonic". pytest resolves a dotted
+    # string by importing its root, so patching through `main` imports main BEFORE
+    # load_main() sets the environment -- which exits 1 at the PFSENSE_HOSTNAME
+    # check. These three tests then passed only because an earlier test had left a
+    # configured main in sys.modules, and failed when run on their own.
+    monkeypatch.setattr("time.monotonic", clock)
     main, _fake_client = load_main(monkeypatch)
     nameserver = RecordingNameserver(apply_result=False)
     main.NAMESERVER = nameserver
     monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 10.0)
-    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 3600.0)
+    # A real cap, not 3600: with the max-wait branch unreachable, _defer_retry could
+    # lose its `PENDING_SINCE` half unnoticed -- and that half is what stops the
+    # max-wait branch firing on every tick from the original burst onward.
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 60.0)
 
     _stage_one_change(main, nameserver, clock)
 
@@ -1236,6 +1300,14 @@ def test_a_failed_flush_defers_the_next_attempt(monkeypatch):
     assert nameserver.flush_applies == 2
     assert main.PENDING_CHANGES == 1
 
+    # _defer_retry must move BOTH timers, not just LAST_CHANGE_AT. Dropping the
+    # PENDING_SINCE half leaves it pointing at the original burst, so once that first
+    # 60s max-wait horizon passes the max-wait branch fires on every two-second tick --
+    # a retry storm during exactly the outage this deferral exists to ride out. The
+    # timing assertions above cannot see it, because the quiet window governs first.
+    assert main.PENDING_SINCE == clock.now
+    assert main.LAST_CHANGE_AT == clock.now
+
 
 def test_a_second_staged_change_does_not_restart_the_starvation_cap(monkeypatch):
     """
@@ -1248,7 +1320,12 @@ def test_a_second_staged_change_does_not_restart_the_starvation_cap(monkeypatch)
     real code applied four times.
     """
     clock = FakeClock()
-    monkeypatch.setattr("main.time.monotonic", clock)
+    # Target the stdlib module, NOT "main.time.monotonic". pytest resolves a dotted
+    # string by importing its root, so patching through `main` imports main BEFORE
+    # load_main() sets the environment -- which exits 1 at the PFSENSE_HOSTNAME
+    # check. These three tests then passed only because an earlier test had left a
+    # configured main in sys.modules, and failed when run on their own.
+    monkeypatch.setattr("time.monotonic", clock)
     main, _fake_client = load_main(monkeypatch)
     nameserver = RecordingNameserver()
     main.NAMESERVER = nameserver
@@ -1289,7 +1366,12 @@ def test_a_confirmed_apply_clears_the_coalescing_timers(monkeypatch):
     behaves identically either way.
     """
     clock = FakeClock()
-    monkeypatch.setattr("main.time.monotonic", clock)
+    # Target the stdlib module, NOT "main.time.monotonic". pytest resolves a dotted
+    # string by importing its root, so patching through `main` imports main BEFORE
+    # load_main() sets the environment -- which exits 1 at the PFSENSE_HOSTNAME
+    # check. These three tests then passed only because an earlier test had left a
+    # configured main in sys.modules, and failed when run on their own.
+    monkeypatch.setattr("time.monotonic", clock)
     main, _fake_client = load_main(monkeypatch)
     nameserver = RecordingNameserver()
     main.NAMESERVER = nameserver
@@ -1454,6 +1536,56 @@ def test_a_no_op_removal_during_a_burst_does_not_inflate_the_pending_count(monke
     main.process_stop_event("caddy.lab.internal", "a.lab.internal")
 
     assert main.PENDING_CHANGES == 1
+
+
+def test_a_no_op_addition_during_a_burst_does_not_inflate_the_pending_count(monkeypatch):
+    """
+    The same no-op guard on the ADDITION path, which was pinned by nothing.
+
+    Both existing no-op tests drive process_stop_event only, and the one test that does
+    cover the start path uses unapplied_changes=False -- which masks the argument
+    entirely, since with nothing staged both branches of _record_change_outcome are
+    no-ops regardless. Hardcoding `mutated` to True in process_start_event therefore
+    survived, while the identical mutation one function below is killed twice.
+
+    Docker re-delivers `start` for a restart-looping container, and adding an alias that
+    already exists returns False having changed nothing.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "LAST_APPLY_AT", time.monotonic())
+
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    assert main.PENDING_CHANGES == 1
+    change_at = main.LAST_CHANGE_AT
+
+    # The alias already exists: the mutator returns False and changes nothing.
+    nameserver.mutation_result = False
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+
+    assert main.PENDING_CHANGES == 1
+    assert main.LAST_CHANGE_AT == change_at
+
+
+def test_a_lone_container_stop_applies_immediately(monkeypatch):
+    """
+    A lone stop must go live at once, as a lone start does.
+
+    The start path has test_a_lone_container_start_applies_immediately; the stop path
+    had nothing, so hardcoding `immediate = False` there survived and a single container
+    stop would wait a full quiet window before the name stopped resolving.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+
+    main.process_stop_event("caddy.lab.internal", "gone.lab.internal")
+
+    assert nameserver.staged == [("gone.lab.internal", True)]
+    assert nameserver.immediate_applies == 1
+    assert main.PENDING_CHANGES == 0
 
 
 def test_a_no_op_event_does_not_hold_the_quiet_window_open(monkeypatch):

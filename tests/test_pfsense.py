@@ -1533,6 +1533,157 @@ def test_a_rejected_mutation_stages_nothing_even_when_not_applying(monkeypatch):
     assert client.change_count == 0
 
 
+def test_the_token_never_appears_in_any_log_from_any_operation(monkeypatch, caplog):
+    """
+    A general assertion, because the four specific ones only cover _handle_api_error.
+
+    AGENTS.md states "Never log API tokens" as an invariant, but every test defending it
+    drove one error path. Adding `key={self.pfsense_api_key}` to the CONSTRUCTOR's
+    startup line left the whole suite green and printed the token on every start -- and
+    from there into whatever ships the container logs. Any new log site touching the
+    token was unguarded.
+
+    This drives a representative slice of the module -- construction, a read, both
+    mutators, an apply, and a rejection -- and asserts the token appears nowhere.
+    """
+    token = "SUPER-SECRET-API-TOKEN"
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.delete", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+
+    with caplog.at_level(logging.DEBUG):
+        client = PFSense("pfsense.lab.internal", token)
+        client.get_all_host_overrides = lambda: [
+            {
+                "id": 12,
+                "host": "caddy",
+                "domain": "lab.internal",
+                "aliases": [
+                    {"id": 0, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}
+                ],
+            }
+        ]
+        client.add_host_override_alias("caddy.lab.internal", "new.lab.internal", "a note")
+        client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal")
+        client.apply_changes()
+        # Rejections log the value they rejected, so they are a real risk here.
+        client.add_host_override_alias("caddy.lab.internal", "bad alias.lab.internal")
+        client.del_host_override_alias("missing.lab.internal", "nope.lab.internal")
+
+    assert token not in caplog.text
+
+
+def test_the_apply_poll_waits_between_attempts(monkeypatch):
+    """
+    The inter-poll sleep is what makes confirmation possible at all.
+
+    The suite stubs pfsense.time.sleep everywhere -- correctly, for speed -- so removing
+    it entirely left the suite green. Against a real firewall unbound takes seconds to
+    reload, so with no wait all fifteen polls complete in microseconds, every apply
+    reports "not confirmed applied after 15 attempts", unapplied_changes never clears,
+    and the coalescer retries forever.
+
+    Counting the stubbed calls pins it without unstubbing anything.
+    """
+    slept = []
+    monkeypatch.setattr("pfsense.time.sleep", slept.append)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+
+    # Report "not applied" four times, then applied.
+    results = iter([False, False, False, False, True])
+
+    def poll(**_kwargs):
+        return FakeResponse({"data": {"applied": next(results)}})
+
+    monkeypatch.setattr("pfsense.requests.get", poll)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    assert client.apply_changes() is True
+
+    # One wait between each unsuccessful poll and the next attempt.
+    assert slept == [pfsense.APPLY_POLL_DELAY_SECONDS] * 4
+
+
+# --- Two domains, so a host match can be told from a host-and-domain match --------
+#
+# Every other FQDN in this file lives under lab.internal. With one domain, dropping the
+# `domain ==` half of either lookup is invisible: the host part alone always identifies
+# the right record. These two tests exist purely to supply the second domain.
+
+TWO_DOMAIN_OVERRIDES = [
+    {
+        "id": 1,
+        "host": "caddy",
+        "domain": "dmz.internal",
+        "aliases": [
+            {"id": 0, "parent_id": 1, "host": "nginx", "domain": "dmz.internal"},
+        ],
+    },
+    {
+        "id": 2,
+        "host": "caddy",
+        "domain": "lab.internal",
+        "aliases": [
+            {"id": 0, "parent_id": 2, "host": "nginx", "domain": "lab.internal"},
+        ],
+    },
+]
+
+
+def test_a_host_override_is_matched_on_domain_as_well_as_host(monkeypatch):
+    """
+    Two host overrides can share a host name under different domains.
+
+    Dropping `and host_override.get('domain') == domain` from find_host_name left the
+    whole suite green, and then a container labelled with the lab.internal parent had
+    its alias attached to the DMZ host override instead -- so the name resolves to the
+    wrong address on the wrong network.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: TWO_DOMAIN_OVERRIDES
+
+    assert client.find_host_name("caddy.lab.internal")["id"] == 2
+    assert client.find_host_name("caddy.dmz.internal")["id"] == 1
+    assert client.find_host_name("caddy.other.internal") is None
+
+
+def test_an_alias_is_matched_on_domain_as_well_as_host(monkeypatch):
+    """
+    Same hole one level down, and this one deletes the wrong record.
+
+    Dropping the domain comparison in find_alias_in_host_override also left the suite
+    green, and a stop event for nginx.lab.internal then issued a delete for
+    nginx.dmz.internal -- removing an alias on an object this service never created.
+    """
+    deletes = []
+
+    def record(**kwargs):
+        deletes.append(kwargs["json"])
+        return FakeResponse({"data": []})
+
+    monkeypatch.setattr("pfsense.requests.delete", record)
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: FakeResponse())
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: TWO_DOMAIN_OVERRIDES
+
+    dmz = TWO_DOMAIN_OVERRIDES[0]
+    assert client.find_alias_in_host_override(dmz, "nginx.dmz.internal") is not None
+    # The DMZ override does not hold the lab alias, so this must find nothing...
+    assert client.find_alias_in_host_override(dmz, "nginx.lab.internal") is None
+
+    # ...and a removal aimed at the DMZ parent for a lab alias must send no delete.
+    assert client.del_host_override_alias("caddy.dmz.internal", "nginx.lab.internal") is False
+    assert deletes == []
+
+    # The correctly targeted removal does go through.
+    assert client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is True
+    assert deletes == [{"parent_id": "2", "id": "0"}]
+
+
 def test_apply_changes_status_poll_constructs_request(monkeypatch):
     """
     The status poll is the newest request site and was the only one with no exact-call
