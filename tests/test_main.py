@@ -407,6 +407,56 @@ def test_import_exits_when_docker_client_cannot_initialize(monkeypatch):
         sys.modules.pop("main", None)
 
 
+def test_import_exits_when_the_ca_bundle_is_not_readable(monkeypatch, caplog, tmp_path, capsys):
+    """
+    An unreadable PFSENSE_CA_BUNDLE must fail loudly at startup, not per request.
+
+    This path used to surface as an opaque crash loop out of `requests` — a bare
+    OSError on every call — which pushed operators toward turning TLS verification
+    off to get the service running. The message therefore has to name the path so
+    the fix is obvious. It is deliberately *not* sanitized: the value comes from
+    whoever configures the service, who already owns the process, so escaping it
+    would defend against nobody. See AGENTS.md, "Exclusions".
+    """
+    missing = tmp_path / "no-such-ca.pem"
+
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            load_main(monkeypatch, ca_bundle=str(missing))
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("import did not exit")
+
+    critical = [m for m in log_messages(caplog) if "is not readable" in m]
+    assert len(critical) == 1
+    assert str(missing) in critical[0]
+    # The remedy belongs in the message; an operator seeing only "not readable" has
+    # no reason to suspect a missing bind mount.
+    assert "mounted into the container" in critical[0]
+    # Never print the token while reporting a configuration error.
+    assert "test-token" not in caplog.text
+    assert "test-token" not in capsys.readouterr().err
+
+
+def test_a_readable_ca_bundle_starts_normally(monkeypatch, tmp_path):
+    """
+    The startup check rejects an *unreadable* bundle, not the mere presence of one.
+
+    Without this, inverting the condition in main.py would still leave the test
+    above green while making every custom CA bundle fatal.
+    """
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-- not a real certificate --\n")
+
+    main, _fake_client = load_main(monkeypatch, verify_ssl="false", ca_bundle=str(bundle))
+
+    assert main.PFSENSE_CA_BUNDLE == str(bundle)
+    # PFSENSE_CA_BUNDLE wins over PFSENSE_VERIFY_SSL: main passes both down and
+    # PFSense resolves the precedence, so main must not drop the bundle here.
+    assert main.PFSENSE_VERIFY_SSL is False
+
+
 def test_cleanup_closes_client_and_exits_zero(monkeypatch):
     main, fake_client = load_main(monkeypatch)
 
