@@ -1443,6 +1443,96 @@ def test_staging_logs_staged_not_added(monkeypatch, caplog):
 # --- TLS verification on the apply-status poll --------------------------------
 
 
+def test_the_write_paths_track_verify_ssl_rather_than_a_constant(monkeypatch):
+    """
+    The two requests that MUTATE the firewall must verify TLS, and that was unpinned.
+
+    Hardcoding `verify=False` in both _mutate_alias and apply_changes' POST left all
+    169 tests green. The tests that looked like they covered those sites built their
+    client with verify_ssl=False, so the expected `"verify": False` was indistinguishable
+    from a hardcoded constant.
+
+    A CA bundle path is the fix, and this repository already knew it: the status-poll
+    test says so in its own docstring. The technique was simply never carried to the two
+    requests that carry the mutation -- the alias POST/DELETE and the apply POST, which
+    are exactly the calls whose credential rewrites firewall DNS.
+    """
+    bundle = "/etc/ssl/pfsense-ca.pem"
+    seen = []
+
+    def record(**kwargs):
+        seen.append((kwargs["url"].rsplit("/", 1)[-1], kwargs["verify"]))
+        return FakeResponse({"data": []})
+
+    monkeypatch.setattr("pfsense.requests.post", record)
+    monkeypatch.setattr("pfsense.requests.delete", record)
+    monkeypatch.setattr("pfsense.requests.get", applied_status_get())
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token", ca_bundle=bundle)
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [{"id": 0, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}],
+        }
+    ]
+
+    assert client.add_host_override_alias("caddy.lab.internal", "new.lab.internal") is True
+    assert client.del_host_override_alias("caddy.lab.internal", "nginx.lab.internal") is True
+
+    # Every mutating request and every apply must carry the bundle, not a constant.
+    assert seen, "no requests were made"
+    for endpoint, verify in seen:
+        assert verify == bundle, (endpoint, verify)
+    assert {endpoint for endpoint, _ in seen} == {"alias", "apply"}
+
+
+def test_a_rejected_mutation_stages_nothing_even_when_not_applying(monkeypatch):
+    """
+    raise_for_status() in _mutate_alias was unpinned: deleting it left the suite green.
+
+    The two tests that looked like they covered it called the mutator with the default
+    apply=True, so with the status check gone the *apply* still failed and their
+    `assert not ...` still held. Driving it with apply=False isolates the status check.
+
+    Without it, a 422 from pfSense -- a name it rejects, a field it dislikes -- returns
+    True, sets unapplied_changes, increments change_count, and logs "staged". The
+    coalescer then schedules an unbound reload for an alias that does not exist, and the
+    operator reads "staged" for a mutation the firewall refused.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    rejected = FakeResponse({})
+    rejected.status_code = 422
+    rejected.error = requests.HTTPError("422 Client Error: Unprocessable Entity")
+    rejected.error.response = rejected
+
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: rejected)
+    monkeypatch.setattr("pfsense.requests.delete", lambda **_kwargs: rejected)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {
+            "id": 12,
+            "host": "caddy",
+            "domain": "lab.internal",
+            "aliases": [{"id": 0, "parent_id": 12, "host": "nginx", "domain": "lab.internal"}],
+        }
+    ]
+
+    assert client.add_host_override_alias(
+        "caddy.lab.internal", "new.lab.internal", apply=False
+    ) is False
+    assert client.del_host_override_alias(
+        "caddy.lab.internal", "nginx.lab.internal", apply=False
+    ) is False
+
+    assert client.unapplied_changes is False
+    assert client.change_count == 0
+
+
 def test_apply_changes_status_poll_constructs_request(monkeypatch):
     """
     The status poll is the newest request site and was the only one with no exact-call

@@ -18,7 +18,7 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (169 tests)
+.venv/bin/python -m pytest                          # full suite (173 tests)
 .venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
@@ -161,6 +161,8 @@ Tests drive `main()` by monkeypatching `main.iter_events` with a finite iterable
 
 With `apply=False`, a `True` return means **staged in the pfSense configuration but not yet live**. Staged changes persist and go live on the next successful apply. The log says "staged", not "added"/"removed", because an operator reading "removed" while the name still resolves is worse than no message at all.
 
+**A timer property needs a controlled clock, not an edited threshold.** Several coalescing invariants are invisible otherwise, because moving `APPLY_QUIET_SECONDS` proves only that the threshold is read, not that a timestamp moved — and in a fast test the timestamps are microseconds apart, so wall time cannot separate them either. That is how `test_a_failed_flush_defers_the_next_attempt` came to name a property it could not detect: gutting `_defer_retry` to `pass` left the whole suite green. `tests/test_main.py`'s `FakeClock` patches `main.time.monotonic`; use it for anything involving `PENDING_SINCE`, `LAST_CHANGE_AT`, or `LAST_APPLY_AT`.
+
 **`PFSense.unapplied_changes` is the source of truth, not the return value.** A mutation can land while its apply fails, which returns `False` even though something is now staged. `unapplied_changes` is set as soon as the mutation POST succeeds and cleared only by a confirmed apply. `main._record_change_outcome()` consults it rather than the boolean — trusting the boolean stranded those changes, because nothing was pending so nothing ever retried and the alias never went live.
 
 For the same reason, **a failed flush keeps its changes pending**. `flush_pending_changes()` calls `_defer_retry()` rather than `_record_applied()` when the apply fails, so a later tick or the shutdown flush retries. `_defer_retry()` pushes the timers out a full quiet window so a pfSense outage is not retried on every two-second window tick.
@@ -261,7 +263,7 @@ The intended order for a behavior change is **planner → tester → implementer
 
 **The contract:** the tester owns everything under `tests/`. The implementer may not create, edit, or delete those files — not to fix a failure, not to soften an assertion, not to add a skip. When the implementer believes a test encodes the wrong requirement it escalates to the planner, which rules one of three ways: the test is right and the implementation must change (the default), the test is wrong and the *tester* revises it, or the plan was ambiguous and the plan changes first. Difficulty satisfying a test is not evidence that the test is wrong.
 
-This matters here because the assertions are deliberately precise — `tests/test_pfsense.py` pins exact `requests` call sequences and kwargs, which is what makes a dropped `/apply` call or a weakened TLS `verify` fail loudly instead of silently. An implementer that can edit the test can erase the safety net rather than satisfy it.
+This matters here because the assertions are deliberately precise — `tests/test_pfsense.py` pins exact `requests` call sequences and kwargs, which is what makes a dropped `/apply` call or a weakened TLS `verify` fail loudly instead of silently. **A `verify` assertion is only meaningful against a CA bundle path.** A test that builds its client with `verify_ssl=False` and then asserts `"verify": False` cannot tell "tracks `self.verify_ssl`" from "is hardcoded to a constant" — hardcoding `verify=False` in `_mutate_alias` and in `apply_changes`' POST passed the entire suite for exactly that reason, on the two requests that mutate the firewall. A bundle path is a value neither `True` nor `False` can accidentally match, so use one whenever pinning `verify`. An implementer that can edit the test can erase the safety net rather than satisfy it.
 
 The reviewer enforces this by checking `git diff main...HEAD -- tests/` and confirming any change there traces to a planner ruling. A human working directly is bound by the same rule: change tests deliberately, as a decision, not as a way to get to green.
 
