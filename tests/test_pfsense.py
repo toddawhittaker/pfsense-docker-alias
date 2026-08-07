@@ -681,22 +681,173 @@ def test_add_host_override_alias_returns_false_for_malformed_alias_fqdn(monkeypa
     assert not client.add_host_override_alias("caddy.lab.internal", "nginx")
 
 
-def test_add_host_override_alias_rejects_hostile_fqdn_values(monkeypatch):
+def test_a_rejected_fqdn_never_reaches_the_api(monkeypatch):
+    """
+    The payload barrier is proven by NO REQUEST BEING MADE, not by a False return.
+
+    The superseded version of this test asserted only `not add_host_override_alias(...)`
+    and never stubbed requests.post. When the barrier admitted a value, the call fell
+    through to a real HTTPS request to pfsense.lab.internal, which failed and returned
+    False anyway -- so the assertion could not tell "rejected by the barrier" from "the
+    network was down". Widening DNS_LABEL_PATTERN to admit a double quote left the whole
+    suite green, and the hostile value reached the payload:
+
+        {'parent_id': '12', 'host': 'ngi"nx', 'domain': 'lab.internal', 'descr': ''}
+
+    That character matters specifically: AGENTS.md records that an alias host is written
+    into unbound.conf's double-quoted local-data: directive with no escaping, and that a
+    malformed name leaves unbound not running at all -- a firewall-wide DNS outage that
+    POST /dns_resolver/apply still reports as applied.
+    """
+    requests_made = []
+
+    def record(**kwargs):
+        requests_made.append(kwargs)
+        return FakeResponse({"data": []})
+
+    monkeypatch.setattr("pfsense.requests.post", record)
+    monkeypatch.setattr("pfsense.requests.delete", record)
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
     client = PFSense("pfsense.lab.internal", "secret-token")
     client.get_all_host_overrides = lambda: [
-        {
-            "id": 12,
-            "host": "caddy",
-            "domain": "lab.internal",
-            "aliases": [],
-        }
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
     ]
 
-    assert not client.add_host_override_alias("caddy.lab.internal", "bad alias.lab.internal")
-    assert not client.add_host_override_alias("caddy.lab.internal", "bad\nalias.lab.internal")
-    assert not client.add_host_override_alias("caddy.lab.internal", "bad..alias.lab.internal")
-    assert not client.add_host_override_alias("caddy.lab.internal", "-bad.lab.internal")
-    assert not client.add_host_override_alias("caddy.lab.internal", "bad-.lab.internal")
+    hostile = [
+        'ngi"nx.lab.internal',              # the unbound.conf quoting character
+        "bad alias.lab.internal",           # space
+        "bad\nalias.lab.internal",          # embedded newline
+        "trailing.lab.internal\n",          # trailing newline: $ matches before it
+        "bad..alias.lab.internal",          # empty label
+        "-bad.lab.internal",                # leading hyphen
+        "bad-.lab.internal",                # trailing hyphen
+        "bad;alias.lab.internal",           # shell metacharacter
+        "a" * 64 + ".lab.internal",         # label over 63
+        ("a" * 63 + ".") * 4 + "lab.internal",  # FQDN over 253
+        "single",                           # fewer than two labels
+    ]
+
+    for fqdn in hostile:
+        assert client.add_host_override_alias("caddy.lab.internal", fqdn) is False, fqdn
+        assert client.del_host_override_alias("caddy.lab.internal", fqdn) is False, fqdn
+
+    # The assertion that actually pins the barrier.
+    assert requests_made == [], requests_made
+    assert client.unapplied_changes is False
+    assert client.change_count == 0
+
+
+def test_a_non_iterable_data_payload_does_not_crash_the_service(monkeypatch):
+    """
+    The shape that actually needs the isinstance guard is a non-iterable `data`.
+
+    The existing corpus used {"data": {...}} for its "not a list" case, but a dict IS
+    iterable, so the comprehension filters it to [] with or without the guard --
+    deleting the guard left the whole suite green. `{"data": null}` is entirely
+    plausible from a REST API with nothing configured, and it raises TypeError from the
+    comprehension, which is OUTSIDE the try/except. That escapes every handler up to
+    run() and exits the process: the crash loop AGENTS.md says must degrade to a
+    warning.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    for payload in ({"data": None}, {"data": 5}, {"data": True}):
+        monkeypatch.setattr("pfsense.requests.get", lambda **_kwargs: FakeResponse(payload))
+        client = PFSense("pfsense.lab.internal", "secret-token")
+        # Must degrade to an empty list, not raise.
+        assert client.get_all_host_overrides() == [], payload
+
+
+def test_a_non_iterable_aliases_value_does_not_crash_the_service(monkeypatch):
+    """
+    Same shape one level down, and this one has no handler at all above it.
+
+    find_alias_in_host_override is called directly by del_host_override_alias with no
+    try/except in between, so a TypeError here goes straight out of the module.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    for aliases in (None, 5, True):
+        override = {"id": 1, "host": "caddy", "domain": "lab.internal", "aliases": aliases}
+        assert client.find_alias_in_host_override(override, "x.lab.internal") is None, aliases
+
+
+def test_redaction_runs_before_sanitizing(monkeypatch, caplog):
+    """
+    The order in _handle_api_error is load-bearing and was previously untested.
+
+    Two ways the swapped order leaks, both confirmed:
+
+    1. sanitize_for_log escapes backslashes, so a token containing one is rendered
+       `a\\b` and the literal match then misses it entirely.
+    2. sanitize_for_log truncates at LOG_VALUE_MAX_CHARS, so a token straddling that
+       boundary is cut in half and the surviving fragment is logged.
+
+    Redacting first sees the whole, unescaped string, so neither applies.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    # A backslash survives main.py's printability and latin-1 gates, so this is a
+    # token an operator could really be running with.
+    token = "SECRET\\WITH\\BACKSLASH"
+
+    def fake_get(**_kwargs):
+        raise ValueError(f"Invalid header value {token}")
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+    client = PFSense("pfsense.lab.internal", token)
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "SECRET" not in caplog.text
+    assert "BACKSLASH" not in caplog.text
+
+    # And a token past the truncation boundary.
+    caplog.clear()
+    long_token = "T" * 40
+    padding = "x" * (pfsense.LOG_VALUE_MAX_CHARS - 20)
+
+    def fake_get_long(**_kwargs):
+        raise ValueError(f"{padding}{long_token}{padding}")
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get_long)
+    client = PFSense("pfsense.lab.internal", long_token)
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    # No run of the token long enough to be recognisable may survive.
+    assert "T" * 20 not in caplog.text
+
+
+def test_a_valid_fqdn_does_reach_the_api(monkeypatch):
+    """
+    The companion to the above: proof the rejection test is not vacuous the other way.
+
+    A test that asserts "no request was made" passes trivially if nothing can ever make
+    a request. This pins that the same setup does issue one for a well-formed name.
+    """
+    requests_made = []
+
+    def record(**kwargs):
+        requests_made.append(kwargs)
+        return FakeResponse({"data": []})
+
+    monkeypatch.setattr("pfsense.requests.post", record)
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    assert client.add_host_override_alias("caddy.lab.internal", "ok.lab.internal", apply=False)
+
+    assert len(requests_made) == 1
+    assert requests_made[0]["json"]["host"] == "ok"
+    assert requests_made[0]["json"]["domain"] == "lab.internal"
 
 
 def test_del_host_override_alias_constructs_delete_and_apply_requests(monkeypatch):

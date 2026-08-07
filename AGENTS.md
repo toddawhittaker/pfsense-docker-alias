@@ -18,7 +18,7 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (164 tests)
+.venv/bin/python -m pytest                          # full suite (169 tests)
 .venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
@@ -103,7 +103,7 @@ Reading env vars, `docker.from_env()`, and `signal.signal()` registration all ha
 Deliberately asymmetric — keep it that way:
 
 - pfSense API failures **log and return `False`**; they never raise, so one bad container can't kill the service.
-- `_request` retries `requests.RequestException`, `OSError` and `ValueError` up to `API_REQUEST_ATTEMPTS` (3) with a 1s sleep. `raise_for_status()` is called *outside* the retry, so HTTP error statuses are not retried. Tests monkeypatch `pfsense.time.sleep`.
+- `_request` retries everything in `API_ERRORS` up to `API_REQUEST_ATTEMPTS` (3) with a 1s sleep. `raise_for_status()` is called *outside* the retry, so HTTP error statuses are not retried. Tests monkeypatch `pfsense.time.sleep`.
 - Docker event-stream errors **re-raise** out of `main()`; `run()` catches and exits non-zero so the container restarts.
 
 ### Mutations are staged, then applied
@@ -171,7 +171,7 @@ For the same reason, **a failed flush keeps its changes pending**. `flush_pendin
 
 `get_all_host_overrides()` validates the payload shape — it returns `[]` for a non-list `data` and drops non-dict entries — and every accessor uses `.get()` rather than indexing. A well-formed 200 with an unexpected body previously raised `KeyError`/`TypeError` straight out of this module, which `main()` does not catch, exiting the service instead of logging and carrying on. An API schema change must degrade to a warning, never a crash loop.
 
-`_request` catches `OSError` **and `ValueError`** as well as `RequestException`. `ValueError` is there because `http.client` raises `UnicodeEncodeError` — a `ValueError`, not a `RequestException` — when a header will not encode as latin-1, and that escaped every handler up to `run()`, which exits the process. The rule the code comment states and this file must not lose: **the mutation and apply paths must not catch strictly less than the read path.** `get_all_host_overrides` already caught `ValueError`, which is the only reason the escape was unreachable in practice rather than by design; `test_a_value_error_in_a_mutation_does_not_escape` pins it. `requests` raises a **bare `OSError`** when `verify` names an unreadable CA bundle, which used to escape every public method and crash-loop the container — pushing operators toward disabling TLS verification to get the service running. `main.py` also checks `PFSENSE_CA_BUNDLE` is readable at startup and exits with a clear message, since that is a configuration error worth failing loudly on.
+Every handler that wraps an API call uses the single `API_ERRORS` tuple — `(RequestException, OSError, ValueError, AttributeError)`. That is structural, not a convention: this file previously *stated* that the mutation and apply paths must not catch strictly less than the read path, and the code did not hold it — four handlers had four different tuples and the narrowest caught only `RequestException`. Nothing was live, because `_request` normalises everything beneath them, but a rule asserted in prose and contradicted by the source is worse than no rule. One tuple makes the claim true by construction. `ValueError` is there because `http.client` raises `UnicodeEncodeError` — a `ValueError`, not a `RequestException` — when a header will not encode as latin-1, and that escaped every handler up to `run()`, which exits the process. The rule the code comment states and this file must not lose: **the mutation and apply paths must not catch strictly less than the read path.** `get_all_host_overrides` already caught `ValueError`, which is the only reason the escape was unreachable in practice rather than by design; `test_a_value_error_in_a_mutation_does_not_escape` pins it. `requests` raises a **bare `OSError`** when `verify` names an unreadable CA bundle, which used to escape every public method and crash-loop the container — pushing operators toward disabling TLS verification to get the service running. `main.py` also checks `PFSENSE_CA_BUNDLE` is readable at startup and exits with a clear message, since that is a configuration error worth failing loudly on.
 
 `add_host_override_alias` first calls `find_host_name(alias_fqdn)` to reject an alias already used as a host override or alias anywhere, then resolves the parent host override — the override must already exist in pfSense; this service never creates one.
 

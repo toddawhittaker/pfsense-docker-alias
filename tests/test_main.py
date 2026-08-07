@@ -85,6 +85,16 @@ def test_parse_alias_labels_returns_alias_config(monkeypatch):
 
 
 def test_tls_verification_env_defaults_to_true_and_only_false_disables(monkeypatch):
+    """
+    Fail-secure: exactly one spelling disables verification, case-insensitively.
+
+    The name of this test claimed more than its body did. It checked the default,
+    "not-a-bool", and "false" -- but nothing asserted that a DIFFERENT falsy spelling
+    still verifies, so widening the check to `not in ("false", "0", "no")` left the
+    suite green. That is the shape a well-meant usability PR takes, and it silently
+    turns off certificate verification for an operator who set PFSENSE_VERIFY_SSL=0
+    expecting it to be ignored.
+    """
     main, _fake_client = load_main(monkeypatch)
     assert main.PFSENSE_VERIFY_SSL is True
 
@@ -93,6 +103,17 @@ def test_tls_verification_env_defaults_to_true_and_only_false_disables(monkeypat
 
     main, _fake_client = load_main(monkeypatch, verify_ssl="false")
     assert main.PFSENSE_VERIFY_SSL is False
+
+    # Case-insensitivity is deliberate, and pins the .lower() call.
+    for spelling in ("FALSE", "False", "FaLsE"):
+        main, _fake_client = load_main(monkeypatch, verify_ssl=spelling)
+        assert main.PFSENSE_VERIFY_SSL is False, spelling
+
+    # Every OTHER falsy-looking spelling must still verify. This is the direction that
+    # matters: an accidental widening here weakens TLS.
+    for spelling in ("0", "no", "off", "n", "disabled", "", " false ", "false "):
+        main, _fake_client = load_main(monkeypatch, verify_ssl=spelling)
+        assert main.PFSENSE_VERIFY_SSL is True, spelling
 
 
 def test_parse_alias_labels_ignores_incomplete_labels(monkeypatch):
@@ -984,6 +1005,31 @@ def test_a_burst_of_starts_costs_two_applies_not_twenty(monkeypatch):
     assert nameserver.flush_applies == 1
     assert nameserver.total_applies == 2
     assert main.PENDING_CHANGES == 0
+
+
+def test_pending_changes_force_coalescing_even_after_a_quiet_period(monkeypatch):
+    """
+    should_apply_immediately must say no while anything is pending, regardless of clock.
+
+    Deleting `if PENDING_CHANGES: return False` left the suite green, because the burst
+    test is covered redundantly by the LAST_APPLY_AT arithmetic. The guard only bites
+    when changes are pending AND the last apply is old or absent -- which is exactly a
+    pfSense outage being retried by _defer_retry(). Without it, every new container
+    event during that outage would attempt a full apply inline in the event loop: a
+    POST plus up to fifteen one-second polls, per event.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver(apply_result=False)
+    main.NAMESERVER = nameserver
+
+    # One change lands but its apply fails, so it stays pending.
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    assert main.PENDING_CHANGES == 1
+
+    # Make the last apply look long ago, which is what _defer_retry leaves behind.
+    monkeypatch.setattr(main, "LAST_APPLY_AT", None)
+
+    assert main.should_apply_immediately() is False
 
 
 def test_pending_changes_are_not_flushed_before_the_quiet_period(monkeypatch):
