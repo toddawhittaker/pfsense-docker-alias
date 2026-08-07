@@ -675,15 +675,24 @@ def test_process_events_delegate_to_nameserver(monkeypatch):
     main, _fake_client = load_main(monkeypatch)
     added = []
     removed = []
-    main.NAMESERVER = types.SimpleNamespace(
-        unapplied_changes=False,
-        add_host_override_alias=lambda host, alias, descr, apply: added.append(
-            (host, alias, descr, apply)
-        )
-        or True,
-        del_host_override_alias=lambda host, alias, apply: removed.append((host, alias, apply))
-        or True,
-    )
+    # change_count increments on a mutation that lands, as the real PFSense does. The
+    # coalescer compares it across the call to tell a real change from a no-op, so a
+    # fake that never moves it would model a service that never changes anything.
+    nameserver = types.SimpleNamespace(unapplied_changes=False, change_count=0)
+
+    def add(host, alias, descr, apply):
+        added.append((host, alias, descr, apply))
+        nameserver.change_count += 1
+        return True
+
+    def remove(host, alias, apply):
+        removed.append((host, alias, apply))
+        nameserver.change_count += 1
+        return True
+
+    nameserver.add_host_override_alias = add
+    nameserver.del_host_override_alias = remove
+    main.NAMESERVER = nameserver
 
     main.process_start_event("caddy.lab.internal", "nginx.lab.internal", "nginx service")
     main.process_stop_event("caddy.lab.internal", "nginx.lab.internal")
@@ -880,6 +889,10 @@ class RecordingNameserver:
         self.apply_result = apply_result
         self.mutation_result = mutation_result
         self.unapplied_changes = False
+        # Monotonic count of mutations that actually landed. unapplied_changes is a
+        # boolean and saturates, so it cannot tell "this call changed something" from
+        # "something was already staged" once a burst is under way.
+        self.change_count = 0
 
     def _mutate(self, alias, apply):
         self.staged.append((alias, apply))
@@ -887,6 +900,7 @@ class RecordingNameserver:
             return False
 
         self.unapplied_changes = True
+        self.change_count += 1
         if not apply:
             return True
 
@@ -1189,6 +1203,8 @@ def test_a_failed_add_stages_nothing(monkeypatch):
     applies = []
     main.NAMESERVER = types.SimpleNamespace(
         unapplied_changes=False,
+        # Never moves, because neither mutator changes anything -- which is the point.
+        change_count=0,
         add_host_override_alias=lambda *_args, **_kwargs: False,
         del_host_override_alias=lambda *_args, **_kwargs: False,
         apply_changes=lambda: applies.append("apply") or True,
@@ -1201,6 +1217,55 @@ def test_a_failed_add_stages_nothing(monkeypatch):
 
     assert main.PENDING_CHANGES == 0
     assert applies == []
+
+
+def test_a_no_op_removal_during_a_burst_does_not_inflate_the_pending_count(monkeypatch):
+    """
+    Docker emits both `die` and `stop` for one shutdown. The second finds the alias
+    already gone, so the mutator returns False without touching pfSense.
+
+    unapplied_changes is a single boolean that saturates: once anything is staged it
+    stays True, so reading it alone counted that no-op as a staged change. A
+    `docker compose down` of twenty services then reported roughly 38 coalesced
+    changes for 19 real removals.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "LAST_APPLY_AT", time.monotonic())
+
+    main.process_stop_event("caddy.lab.internal", "a.lab.internal")
+    assert main.PENDING_CHANGES == 1
+
+    # The second event for the same container: nothing left to remove.
+    nameserver.mutation_result = False
+    main.process_stop_event("caddy.lab.internal", "a.lab.internal")
+
+    assert main.PENDING_CHANGES == 1
+
+
+def test_a_no_op_event_does_not_hold_the_quiet_window_open(monkeypatch):
+    """
+    A no-op must not restart the coalescing clock.
+
+    A container in a restart loop emitting repeated die/stop for an already-removed
+    alias would otherwise keep pushing LAST_CHANGE_AT forward, delaying a genuinely
+    pending change from the 10s quiet window out to the 60s maximum wait.
+    """
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "LAST_APPLY_AT", time.monotonic())
+
+    main.process_stop_event("caddy.lab.internal", "a.lab.internal")
+    change_at = main.LAST_CHANGE_AT
+
+    nameserver.mutation_result = False
+    main.process_stop_event("caddy.lab.internal", "a.lab.internal")
+
+    assert main.LAST_CHANGE_AT == change_at
 
 
 def test_a_coalesced_removal_is_staged_like_an_addition(monkeypatch):
@@ -1573,6 +1638,69 @@ def test_the_remembered_alias_table_is_bounded(monkeypatch):
     assert len(main.KNOWN_ALIASES) == main.KNOWN_ALIASES_MAX
     assert "id-0" not in main.KNOWN_ALIASES
     assert f"id-{overflow - 1}" in main.KNOWN_ALIASES
+
+
+def test_both_die_and_stop_remove_the_alias_for_a_deleted_container(monkeypatch, caplog):
+    """
+    Docker sends `die` AND `stop` for one shutdown, so the record must survive the first.
+
+    This is the reason recall_alias_config reads the table with .get() rather than
+    .pop(). Dropping the entry on the first event would make the second log
+    "Container not found" for a container that was handled correctly a moment earlier.
+    A mutation to .pop() passed the whole suite before this test existed, because no
+    other test sends two stop events for one container ID.
+    """
+    main, fake_client = load_main(monkeypatch)
+    removals = []
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+    monkeypatch.setattr(
+        main, "process_stop_event", lambda _host_override, alias: removals.append(alias)
+    )
+
+    fake_client.container = _remembering_container("abc123", "nginx", "nginx.lab.internal")
+    main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "start"})
+
+    _container_is_gone(fake_client)
+    with caplog.at_level(logging.WARNING):
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "die"})
+        main.handle_container_event({"Actor": {"ID": "abc123"}, "Action": "stop"})
+
+    assert removals == ["nginx.lab.internal", "nginx.lab.internal"]
+    assert "Container not found" not in caplog.text
+
+
+def test_re_recording_a_container_makes_it_the_newest_entry(monkeypatch):
+    """
+    remember_alias_config deletes before reinserting, so a re-recorded container counts
+    as newest for eviction.
+
+    Eviction relies on dictionaries preserving insertion order. Without the delete, a
+    long-lived container that keeps being re-recorded would keep its original position
+    and be evicted ahead of entries younger than it. Removing the pop passed the whole
+    suite before this test existed, because no other test re-records an ID.
+    """
+    main, fake_client = load_main(monkeypatch)
+    monkeypatch.setattr(main, "process_start_event", lambda *_args: None)
+
+    def start(index):
+        fake_client.container = _remembering_container(
+            f"id-{index}", f"svc{index}", f"svc{index}.lab.internal"
+        )
+        main.handle_container_event({"Actor": {"ID": f"id-{index}"}, "Action": "start"})
+
+    for index in range(main.KNOWN_ALIASES_MAX):
+        start(index)
+    assert len(main.KNOWN_ALIASES) == main.KNOWN_ALIASES_MAX
+
+    # Re-record the oldest entry. It must move to the newest position.
+    start(0)
+    # One more start overflows the table by one, evicting whatever is oldest.
+    start(main.KNOWN_ALIASES_MAX)
+
+    assert len(main.KNOWN_ALIASES) == main.KNOWN_ALIASES_MAX
+    # id-0 was refreshed, so id-1 is now the oldest and is the one to go.
+    assert "id-0" in main.KNOWN_ALIASES
+    assert "id-1" not in main.KNOWN_ALIASES
 
 
 def test_startup_scan_remembers_aliases_for_containers_it_did_not_see_start(monkeypatch):

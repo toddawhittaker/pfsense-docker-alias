@@ -163,6 +163,11 @@ class PFSense:
         # been confirmed applied. Callers use it to keep retrying rather than assuming a
         # False return meant nothing happened.
         self.unapplied_changes = False
+        # Monotonic count of mutations that actually landed. unapplied_changes answers
+        # "is there unapplied work?" but saturates at True, so it cannot answer "did
+        # THIS call change anything?" once a burst is under way. Callers compare this
+        # across a call to tell a real mutation from a no-op.
+        self.change_count = 0
         if self.verify_ssl is False:
             urllib3.disable_warnings(InsecureRequestWarning)
         logger.info(f"pfSense host set to {self.pfsense_host}")
@@ -458,6 +463,7 @@ class PFSense:
         # nothing tracking it -- main._record_change_outcome() reads this flag, not
         # the boolean returned here.
         self.unapplied_changes = True
+        self.change_count += 1
 
         if apply_now and not self.apply_changes():
             return False
