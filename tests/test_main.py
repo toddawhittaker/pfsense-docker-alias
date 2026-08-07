@@ -1169,24 +1169,147 @@ def test_a_stranded_change_is_retried_rather_than_lost(monkeypatch):
     assert main.PENDING_CHANGES == 0
 
 
+class FakeClock:
+    """
+    A controllable time.monotonic, so coalescing timers can be tested at all.
+
+    Several timer properties are invisible without one: a test that fakes the passage
+    of time by editing APPLY_QUIET_SECONDS proves only that the threshold is read, not
+    that the timestamps moved. That is how the deferral test below came to pass while
+    detecting nothing.
+    """
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _stage_one_change(main, nameserver, clock):
+    """Stage a change without an immediate apply, so the coalescer holds it."""
+    main.LAST_APPLY_AT = clock.now
+    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
+    assert nameserver.immediate_applies == 0
+
+
 def test_a_failed_flush_defers_the_next_attempt(monkeypatch):
-    """A pfSense outage must not be retried on every two-second window tick."""
+    """
+    A pfSense outage must not be retried on every two-second window tick.
+
+    The previous version of this test named the property but could not detect its loss.
+    It restored APPLY_QUIET_SECONDS to 3600 before the second flush, so the quiet-window
+    check failed whether or not _defer_retry had pushed the timestamps -- gutting
+    _defer_retry to `pass` left the whole suite green. Both timestamps are microseconds
+    apart in a fast test, so real wall time cannot separate them either.
+
+    With a controlled clock the deferral is observable: after a failed flush, a tick
+    inside the quiet window must not retry, and one after it must.
+    """
+    clock = FakeClock()
+    monkeypatch.setattr("main.time.monotonic", clock)
     main, _fake_client = load_main(monkeypatch)
     nameserver = RecordingNameserver(apply_result=False)
     main.NAMESERVER = nameserver
-    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 10.0)
     monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 3600.0)
 
-    main.process_start_event("caddy.lab.internal", "a.lab.internal", "a")
-    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 0.0)
+    _stage_one_change(main, nameserver, clock)
+
+    # The quiet window elapses; the flush runs and fails.
+    clock.advance(11)
     main.flush_pending_changes()
     assert nameserver.flush_applies == 1
 
-    # Timers were pushed out, so an immediate second tick does not retry.
+    # A tick well inside the new quiet window must NOT retry. Without _defer_retry the
+    # original LAST_CHANGE_AT is still 11s old, so this would fire immediately.
+    clock.advance(5)
+    main.flush_pending_changes()
+    assert nameserver.flush_applies == 1, "retried before the deferral elapsed"
+
+    # Past the deferred window, it retries.
+    clock.advance(6)
+    main.flush_pending_changes()
+    assert nameserver.flush_applies == 2
+    assert main.PENDING_CHANGES == 1
+
+
+def test_a_second_staged_change_does_not_restart_the_starvation_cap(monkeypatch):
+    """
+    _record_staged sets PENDING_SINCE only when it is None, and that guard is the cap.
+
+    Resetting it on every change leaves APPLY_MAX_WAIT_SECONDS unable to ever fire:
+    continuous churn keeps pushing the start of the window forward, so staged changes
+    are never applied by a tick. Measured against a restart-looping container, the
+    mutated form performed zero applies and accumulated sixty pending changes where the
+    real code applied four times.
+    """
+    clock = FakeClock()
+    monkeypatch.setattr("main.time.monotonic", clock)
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    # Quiet never fires, so only the max-wait cap can flush.
     monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 3600.0)
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 60.0)
+
+    _stage_one_change(main, nameserver, clock)
+    started_at = main.PENDING_SINCE
+
+    # Churn keeps arriving, well inside the cap.
+    for _ in range(5):
+        clock.advance(10)
+        main.process_start_event("caddy.lab.internal", "b.lab.internal", "b")
+
+    # The window must still be measured from the FIRST staged change.
+    assert main.PENDING_SINCE == started_at
+
+    # 50s in, the cap has not elapsed.
+    main.flush_pending_changes()
+    assert nameserver.flush_applies == 0
+
+    # Past 60s from the first change, it must fire despite the continuing churn.
+    clock.advance(11)
     main.flush_pending_changes()
     assert nameserver.flush_applies == 1
-    assert main.PENDING_CHANGES == 1
+
+
+def test_a_confirmed_apply_clears_the_coalescing_timers(monkeypatch):
+    """
+    _record_applied must clear PENDING_SINCE and LAST_CHANGE_AT, not just the count.
+
+    Leaving them set makes the max-wait branch fire on the first tick of every later
+    burst, because PENDING_SINCE is still pointing at the previous one. Measured over
+    the same churn, that turned four applies into forty-eight -- twelve times the unbound
+    reloads coalescing exists to avoid. No test ran two bursts through one module
+    instance, and in a freshly imported main PENDING_SINCE is None, so a first burst
+    behaves identically either way.
+    """
+    clock = FakeClock()
+    monkeypatch.setattr("main.time.monotonic", clock)
+    main, _fake_client = load_main(monkeypatch)
+    nameserver = RecordingNameserver()
+    main.NAMESERVER = nameserver
+    monkeypatch.setattr(main, "APPLY_QUIET_SECONDS", 10.0)
+    monkeypatch.setattr(main, "APPLY_MAX_WAIT_SECONDS", 60.0)
+
+    _stage_one_change(main, nameserver, clock)
+    clock.advance(11)
+    main.flush_pending_changes()
+
+    assert nameserver.flush_applies == 1
+    assert main.PENDING_CHANGES == 0
+    assert main.PENDING_SINCE is None
+    assert main.LAST_CHANGE_AT is None
+
+    # A second burst must be measured from its own start, not the previous one.
+    clock.advance(600)
+    _stage_one_change(main, nameserver, clock)
+    main.flush_pending_changes()
+    assert nameserver.flush_applies == 1, "second burst flushed immediately"
 
 
 def test_iter_events_yields_a_tick_after_each_window(monkeypatch):

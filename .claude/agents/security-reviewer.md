@@ -15,7 +15,7 @@ A daemon holding a pfSense API token, mounting `/var/run/docker.sock`, and turni
 
 It authenticates DNS changes on a firewall. It must never reach logs, error messages, exception text, or CI output. `_handle_api_error` deliberately logs the exception and status code but **not** `response.text`, and `test_http_error_logs_status_without_response_body` pins that. Any new error path, debug line, or re-raise that widens what gets logged is a finding. So is anything that puts the token in a URL rather than the `X-API-Key` header.
 
-`PFSense._headers()` is the single construction point for those headers, and `X-API-Key` should appear exactly once in `pfsense.py` — inside it. A request that builds the header dict inline is a finding even when it is byte-identical today, because it silently opts out of any future hardening of `_headers()`. `grep -c X-API-Key pfsense.py` is the check.
+`PFSense._headers()` is the single construction point for those headers, and `X-API-Key` should appear exactly once in `pfsense.py` — inside it. A request that builds the header dict inline is a finding even when it is byte-identical today, because it silently opts out of any future hardening of `_headers()`. `grep -c "'X-API-Key':" pfsense.py` is the check, and it must return exactly 1 — the dict key, not the bare string. Do not use `grep -c X-API-Key`: that counts prose too. The header name now appears in a comment explaining `allow_redirects=False`, so the bare-string count is 2 and reads as a finding when nothing is wrong. A mechanical check stated at the wrong value either false-alarms or teaches the next reviewer to ignore its own number.
 
 ### 2. TLS trust
 
