@@ -107,6 +107,10 @@ also blocks removing it.
 ### Changed
 
 - Base image moved from `python:3.12-alpine` to `python:3.14-alpine`.
+- The published image is now the exact image CI smoke-tested, rather than a rebuild
+  of it, and `:latest` moves only for a plain `vX.Y.Z` tag. A pre-release such as
+  `v0.3.0-rc1` publishes under its own tag and leaves `:latest` untouched, so tracking
+  `:latest` will not put you on a release candidate.
 - Runtime dependencies updated; the pinned set is free of known CVEs as of this
   release, and CI fails on any new advisory.
 - Added `CONTRIBUTING.md` and `test-env/`, which builds a throwaway pfSense VM so

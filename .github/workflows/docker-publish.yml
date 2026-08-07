@@ -6,12 +6,21 @@ on:
     branches:
       - main
     tags:
-      - '*'  # Triggers on all Git tags
+      - 'v*'  # Release tags only, e.g. v0.2.0 or v0.3.0-rc1
   workflow_dispatch:
+
+# A second push to the same ref supersedes the first, so the earlier run should
+# stop rather than burn a runner to completion. Tag runs are never cancelled:
+# they publish, and losing one halfway would leave a partly pushed release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Without this a hung job runs for GitHub's six-hour default.
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -49,6 +58,13 @@ jobs:
           echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
           tar -xzf "${archive}" -C "${RUNNER_TEMP}" actionlint
           "${RUNNER_TEMP}/actionlint" -color
+
+      # actionlint runs shellcheck over `run:` blocks in workflows only. The
+      # shell under test-env/ drives a VM and is not covered by anything else,
+      # so it is linted explicitly here. shellcheck is preinstalled on GitHub
+      # runners; a plain dev box usually needs it installed.
+      - name: Lint shell scripts
+        run: shellcheck -x test-env/*.sh test-env/lib/*.sh
 
       - name: Compile Python files
         run: python -m py_compile main.py pfsense.py
@@ -102,24 +118,42 @@ jobs:
             || { echo "::error::container did not stay running"; exit 1; }
           docker rm -f smoke
 
+      # Hand the publish job the exact image these smoke tests just ran. The
+      # publish job used to rebuild from scratch, so the artifact users pulled
+      # was never the one anything had executed.
+      - name: Save tested image
+        if: startsWith(github.ref, 'refs/tags/')
+        run: docker save pfsense-docker-alias -o "${RUNNER_TEMP}/image.tar"
+
+      - name: Upload tested image
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-image
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
+
   build-and-push:
     if: startsWith(github.ref, 'refs/tags/')
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
 
     steps:
-      # Checkout the repository
-      - name: Checkout code
-        uses: actions/checkout@v7
+      # No checkout and no build: this job publishes the artifact the test job
+      # produced, and must not construct an image of its own.
+      - name: Download tested image
+        uses: actions/download-artifact@v4
+        with:
+          name: tested-image
+          path: ${{ runner.temp }}
 
-      # Set up Docker Buildx for multi-platform builds
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Load tested image
+        run: docker load -i "${RUNNER_TEMP}/image.tar"
 
-      # Log in to GitHub Container Registry
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -127,17 +161,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Extract the version from the Git tag
-      - name: Extract tag version
-        id: extract_tag
-        run: echo "TAG=${GITHUB_REF##*/}" >> "$GITHUB_ENV"
-
-      # Build and push the Docker image
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ env.TAG }}
-            ghcr.io/${{ github.repository }}:latest
+      # :latest moves only for a plain vX.Y.Z tag. A pre-release such as
+      # v0.3.0-rc1 publishes under its own tag and leaves :latest alone, so
+      # nobody tracking :latest is upgraded onto a release candidate. The old
+      # trigger matched every tag and moved :latest for all of them.
+      - name: Push tested image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          docker tag pfsense-docker-alias "${IMAGE}:${tag}"
+          docker push "${IMAGE}:${tag}"
+          if printf '%s' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release tag ${tag}: moving :latest"
+            docker tag pfsense-docker-alias "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          else
+            echo "Tag ${tag} is not a plain vX.Y.Z release: leaving :latest unchanged"
+          fi

@@ -12,6 +12,7 @@
 # Everything it creates lives in $LAB_DIR, outside the repository.
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR  # resolve relative to this script, not the CWD
 # shellcheck source=lib/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
