@@ -398,7 +398,7 @@ def flush_pending_changes(force=False):
         "Retrying after the quiet period."
     )
 
-def _record_change_outcome(succeeded):
+def _record_change_outcome(succeeded, mutated):
     """
     Update coalescing state from what pfSense actually holds, not from the return value
     alone.
@@ -406,7 +406,15 @@ def _record_change_outcome(succeeded):
     A mutation can land in the configuration while its apply fails, which returns False
     even though something is now staged. Trusting the boolean stranded those changes:
     nothing was pending, so nothing ever retried the apply and the alias never went live.
+
+    `mutated` says whether THIS call changed anything, which unapplied_changes cannot:
+    that flag is a single boolean and stays True for the whole burst, so a later no-op --
+    the second of Docker's die/stop pair, finding the alias already gone -- read as a
+    staged change. It inflated the count and restarted the quiet window.
     """
+    if not mutated:
+        return
+
     if NAMESERVER.unapplied_changes:
         _record_staged()
     elif succeeded:
@@ -415,18 +423,20 @@ def _record_change_outcome(succeeded):
 def process_start_event(host_override_fqdn, alias_fqdn, alias_descr):
     """Process a container start event and add an alias if necessary."""
     immediate = should_apply_immediately()
-    _record_change_outcome(
-        NAMESERVER.add_host_override_alias(
-            host_override_fqdn, alias_fqdn, alias_descr, apply=immediate
-        )
+    before = NAMESERVER.change_count
+    succeeded = NAMESERVER.add_host_override_alias(
+        host_override_fqdn, alias_fqdn, alias_descr, apply=immediate
     )
+    _record_change_outcome(succeeded, NAMESERVER.change_count > before)
 
 def process_stop_event(host_override_fqdn, alias_fqdn):
     """Process a container stop event and remove an alias if necessary."""
     immediate = should_apply_immediately()
-    _record_change_outcome(
-        NAMESERVER.del_host_override_alias(host_override_fqdn, alias_fqdn, apply=immediate)
+    before = NAMESERVER.change_count
+    succeeded = NAMESERVER.del_host_override_alias(
+        host_override_fqdn, alias_fqdn, apply=immediate
     )
+    _record_change_outcome(succeeded, NAMESERVER.change_count > before)
 
 NAMESERVER = None
 

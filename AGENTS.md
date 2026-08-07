@@ -18,7 +18,7 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (150 tests)
+.venv/bin/python -m pytest                          # full suite (155 tests)
 .venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
@@ -139,13 +139,15 @@ Coalescing state (`PENDING_CHANGES`, `PENDING_SINCE`, `LAST_CHANGE_AT`, `LAST_AP
 
 So `remember_alias_config()` records `(container_name, alias_config)` in `KNOWN_ALIASES`, keyed by container ID, whenever a start event is handled — and in `add_aliases_on_startup`, which is the only chance to record a container that was already running when this service started. On `NotFound`, `recall_alias_config()` supplies the fallback and the removal proceeds. When nothing was recorded, the original warning still fires.
 
-Three properties are deliberate:
+Three properties are deliberate, and all three are now pinned by tests — two of them were not, and survived deliberate mutation of the source until `test_both_die_and_stop_remove_the_alias_for_a_deleted_container` and `test_re_recording_a_container_makes_it_the_newest_entry` were added:
 
 - **Only a stop is answered from the record.** `recall_alias_config` returns `None` for any action other than `stop`/`die`. A start event for a container that has already gone is genuinely nothing to act on, and treating it as a removal would delete an alias in response to the wrong event.
 - **The `remove_on_stop` opt-in still applies.** The recorded configuration is checked the same way a live label read would be, so falling back never removes an alias the labels did not ask to remove.
 - **Entries are not dropped on stop.** Docker emits both `die` and `stop` for one shutdown, and the second event must reach the same answer as the first. Removing the entry on the first would make the second log "Container not found" for a container that was handled correctly a moment earlier.
 
-That last choice means container IDs — which are never reused — would accumulate for the life of the process, so `KNOWN_ALIASES_MAX` (512) bounds the table and the oldest entry is evicted on overflow. Eviction relies on dictionaries preserving insertion order; `remember_alias_config` deletes before reinserting so a re-recorded container counts as newest. The second removal attempt costs one API call and no extra apply: `del_host_override_alias` returns `False` without mutating when the alias is already absent, so `unapplied_changes` stays clear and `_record_change_outcome` does nothing.
+That last choice means container IDs — which are never reused — would accumulate for the life of the process, so `KNOWN_ALIASES_MAX` (512) bounds the table and the oldest entry is evicted on overflow. Eviction relies on dictionaries preserving insertion order; `remember_alias_config` deletes before reinserting so a re-recorded container counts as newest. The second removal attempt costs one API call and no extra apply: `del_host_override_alias` returns `False` without mutating when the alias is already absent, so `_record_change_outcome` does nothing.
+
+**How that no-op is detected is the subtle part, and reading `unapplied_changes` was not enough.** That flag answers "is there unapplied work?" and saturates at `True` for the length of a burst, so it cannot answer "did *this* call change anything?" — which is the question `_record_change_outcome` actually needs. Reading it alone meant the second of Docker's `die`/`stop` pair counted as a staged change once anything else was pending: a `docker compose down` of twenty services reported roughly 38 coalesced changes for 19 real removals, and a container in a restart loop could hold the quiet window open until the `APPLY_MAX_WAIT_SECONDS` cap. `PFSense.change_count` is therefore a **monotonic count of mutations that landed**, and `process_start_event` / `process_stop_event` compare it across the call and pass the result to `_record_change_outcome` as `mutated`. Both fields are needed and they answer different questions — do not collapse them. A fake nameserver in a test must move `change_count` on a successful mutation, or it models a service that never changes anything.
 
 This is bounded, not unlimited memory: a container that starts, is recorded, and stops more than 512 container-starts later has been evicted, and its `--rm` removal fails the old way. Raising the cap trades memory for that window.
 
