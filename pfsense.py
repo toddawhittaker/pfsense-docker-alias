@@ -219,12 +219,19 @@ class PFSense:
                 # Every endpoint here is an exact /api/v2/... path. Nothing legitimate
                 # redirects, so a redirect is an anomaly to fail on, not to follow.
                 response = method(allow_redirects=False, **kwargs)
-                if response.is_redirect:
+                if 300 <= response.status_code < 400:
                     # Not following it is only half the job: raise_for_status() treats
                     # 3xx as success, so a redirect would otherwise be recorded as a
                     # landed mutation -- setting unapplied_changes for a change that
                     # never reached pfSense. Fail the call instead, and do not retry:
                     # a redirect is a misconfiguration, not a transient fault.
+                    #
+                    # Keyed on the status range, NOT requests' response.is_redirect.
+                    # That attribute is True only for 301/302/303/307/308 *with* a
+                    # Location header, so it reports False for a 302 whose Location a
+                    # proxy stripped, for a bare 304, and for 300 -- leaving exactly
+                    # the responses raise_for_status() also ignores. The status range
+                    # is the shape of that blind spot.
                     logger.error(
                         f"API call during '{context}' was redirected. pfSense's API "
                         "does not redirect, and following it would send the API token "
@@ -333,6 +340,25 @@ class PFSense:
             self._handle_api_error(e, "apply_changes_status")
             return False
 
+    def _redact_token(self, text):
+        """
+        Remove the API token from a string on its way to the log.
+
+        The last line of defence, not the first. Two exception types are known to embed
+        a header value and are suppressed by type above, but that is an allowlist and
+        allowlists go stale -- http.client raises a plain ValueError carrying the value
+        too, and _request was widened to catch ValueError without this list widening
+        with it. That path is unreachable today only because requests validates first
+        and more strictly.
+
+        Known limit: this matches the literal value, so a message rendering the token
+        escaped or in pieces still gets through. It backs up the startup gate in
+        main.py and the type branches; it does not replace either.
+        """
+        if self.pfsense_api_key and self.pfsense_api_key in text:
+            return text.replace(self.pfsense_api_key, "***REDACTED***")
+        return text
+
     def _handle_api_error(self, error, context=""):
         """
         Logs detailed information about API errors.
@@ -360,7 +386,10 @@ class PFSense:
             )
             return
 
-        logger.error(f"API call failed during '{context}': {sanitize_for_log(error)}")
+        logger.error(
+            f"API call failed during '{context}': "
+            f"{sanitize_for_log(self._redact_token(str(error)))}"
+        )
         if isinstance(error, requests.HTTPError) and error.response is not None:
             # `error.response is not None` is required, not defensive noise: this runs
             # inside an `except` block, so an AttributeError here would escape every
