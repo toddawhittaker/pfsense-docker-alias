@@ -18,7 +18,7 @@ uv pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m py_compile main.py pfsense.py   # required after changing either Python file
-.venv/bin/python -m pytest                          # full suite (142 tests)
+.venv/bin/python -m pytest                          # full suite (150 tests)
 .venv/bin/python -m pytest --cov --cov-report=term-missing   # with the coverage gate
 .venv/bin/python -m pytest tests/test_main.py::test_parse_alias_labels_returns_alias_config   # single test
 .venv/bin/python -m pylint main.py pfsense.py       # must stay at 10.00/10
@@ -217,6 +217,12 @@ This no-op has a cost, and it is actionable rather than merely a lament: because
 `test_handle_error_escapes_the_message_but_keeps_the_traceback` asserts through `record.getMessage()`, which structurally excludes `exc_info`. The property that makes that test correct also means a green suite is not evidence the traceback is clean. This finding is defended by review, not by test.
 
 Never log API tokens, secrets, full authorization headers, sensitive environment values, or API response bodies. `_handle_api_error` logs the exception and status code but not `response.text`, and `test_http_error_logs_status_without_response_body` enforces it.
+
+**An exception message can carry the token, so one exception type is never logged.** `requests` validates header values and raises `requests.exceptions.InvalidHeader` with **the offending value embedded in the message**. The only header this service sets is `X-API-Key`, so logging that message printed the API token in cleartext — on every call, since the request fails identically each time, flooding the log and anything downstream of it with a credential that can rewrite firewall DNS. `sanitize_for_log` does not help: it escapes the newline and renders the token characters as they are. `_handle_api_error` therefore returns early for `InvalidHeader` with a fixed message that names `PFSENSE_API_TOKEN` and prints no value. Do not "improve" that branch by including the exception text.
+
+There are two layers, and the outer one is why the inner is rarely reached. `main.py` **trims surrounding whitespace from `PFSENSE_API_TOKEN`** at startup, because a trailing newline is what `$(cat /run/secrets/token)` and a file-based Kubernetes secret both produce, and no API token has meaningful surrounding whitespace — trimming turns the common misconfiguration into a working deployment rather than a loud failure with a secret attached. What survives trimming and is still non-printable (an embedded line break in a pasted token) exits 1 at startup, naming the variable and never the value. The documented deployment paths happened to mask this — `docker run --env-file` strips a trailing `\r` and `docker compose` strips a leading space from a `.env` value — which is exactly why it went unnoticed.
+
+`_handle_api_error`'s status-code branch requires `error.response is not None`. That is load-bearing, not defensive noise: the function runs inside an `except` block, so an `AttributeError` there escapes `_request`'s handler, escapes `_mutate_alias`'s, and reaches `run()`'s broad handler, which exits the process — inverting the contract that an API failure logs and returns `False` rather than killing the service.
 
 `_handle_api_error` also logs one extra line for a `requests.exceptions.SSLError`, naming `PFSENSE_CA_BUNDLE` and `PFSENSE_VERIFY_SSL`. This exists because verification defaults to on while this service's own `v0.1.x` never verified at all, so an upgrading operator meets a certificate error naming a setting they have no reason to know exists. Two properties are deliberate. The hint is **added to** the underlying error, never a replacement for it — the cause matters when the failure is expiry or a hostname mismatch rather than an untrusted issuer. And it keys on `SSLError` specifically, **not** its `ConnectionError` parent: advice to consider switching verification off must not print every time the firewall is briefly unreachable, which is how a fail-secure default gets disabled for an unrelated reason. `test_an_ordinary_connection_error_does_not_suggest_disabling_tls` pins that boundary; widening the check to `ConnectionError` fails it.
 

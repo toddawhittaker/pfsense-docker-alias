@@ -457,6 +457,70 @@ def test_a_readable_ca_bundle_starts_normally(monkeypatch, tmp_path):
     assert main.PFSENSE_VERIFY_SSL is False
 
 
+def _load_main_with_token(monkeypatch, token):
+    """Import main with a specific PFSENSE_API_TOKEN, returning the module."""
+    fake_client = FakeDockerClient()
+    fake_docker = types.SimpleNamespace(
+        from_env=lambda: fake_client,
+        errors=types.SimpleNamespace(DockerException=DockerException, NotFound=DockerNotFound),
+    )
+    monkeypatch.setenv("PFSENSE_HOSTNAME", "pfsense.lab.internal")
+    monkeypatch.setenv("PFSENSE_API_TOKEN", token)
+    monkeypatch.delenv("ADD_ALIASES_ON_STARTUP", raising=False)
+    monkeypatch.delenv("PFSENSE_VERIFY_SSL", raising=False)
+    monkeypatch.delenv("PFSENSE_CA_BUNDLE", raising=False)
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+    sys.modules.pop("main", None)
+    return importlib.import_module("main")
+
+
+def test_surrounding_whitespace_is_trimmed_from_the_token(monkeypatch):
+    """
+    A trailing newline must not break the service, because it is the common case.
+
+    `$(cat /run/secrets/token)` and a file-based Kubernetes secret both produce one.
+    requests rejects such a header value and embeds it in the exception message, which
+    is how the token used to reach the log. No API token has meaningful surrounding
+    whitespace, so trimming is the fix that keeps a working deployment working.
+    """
+    main = _load_main_with_token(monkeypatch, "  tok-abc123\n")
+
+    assert main.PFSENSE_API_TOKEN == "tok-abc123"
+
+
+def test_a_whitespace_only_token_exits_at_startup(monkeypatch, caplog):
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            _load_main_with_token(monkeypatch, "   \n")
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("import did not exit")
+
+    assert "only whitespace" in caplog.text
+
+
+def test_a_token_with_an_embedded_line_break_exits_without_logging_it(monkeypatch, caplog):
+    """
+    Rejecting a malformed secret must not print the secret while doing so.
+
+    Trimming handles surrounding whitespace, so what reaches here is embedded -- a line
+    break in the middle of a pasted token. The message names the variable, never the
+    value, which is the whole point of failing here rather than at the request.
+    """
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            _load_main_with_token(monkeypatch, "SUPERSECRET\nTOKEN")
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("import did not exit")
+
+    assert "PFSENSE_API_TOKEN" in caplog.text
+    assert "SUPERSECRET" not in caplog.text
+    assert "non-printable" in caplog.text
+
+
 def test_cleanup_closes_client_and_exits_zero(monkeypatch):
     main, fake_client = load_main(monkeypatch)
 

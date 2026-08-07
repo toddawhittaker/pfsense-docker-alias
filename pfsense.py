@@ -301,8 +301,30 @@ class PFSense:
         :param error: The exception raised during the API call.
         :param context: Additional context about the API call.
         """
+        if isinstance(error, requests.exceptions.InvalidHeader):
+            # Do NOT log this exception's message. requests embeds the offending header
+            # value in it, and the only header this service sets is the API token, so
+            # logging the message prints the token in cleartext -- on every call, since
+            # the request fails identically each time. sanitize_for_log does not save
+            # us here: it escapes the newline and renders the token characters as-is.
+            #
+            # main.py trims surrounding whitespace from the token so the common causes
+            # (a file-based secret, `$(cat ...)`) never reach this branch at all. This
+            # is the second layer, for a token malformed some other way and for any
+            # caller constructing PFSense directly.
+            logger.error(
+                f"API call failed during '{context}': the request headers were "
+                "rejected as malformed. Check PFSENSE_API_TOKEN for stray whitespace "
+                "or line breaks. The value is not logged."
+            )
+            return
+
         logger.error(f"API call failed during '{context}': {sanitize_for_log(error)}")
-        if isinstance(error, requests.HTTPError):
+        if isinstance(error, requests.HTTPError) and error.response is not None:
+            # `error.response is not None` is required, not defensive noise: this runs
+            # inside an `except` block, so an AttributeError here would escape every
+            # handler up to run() and exit the process -- inverting the contract that an
+            # API failure logs and returns False rather than killing the service.
             logger.error(f"HTTP Status Code: {error.response.status_code}")
         if isinstance(error, requests.exceptions.SSLError):
             # requests reports the cause accurately but names nothing an operator can
