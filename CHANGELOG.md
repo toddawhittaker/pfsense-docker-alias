@@ -3,7 +3,7 @@
 This project uses semantic versioning. It is still on `0.x`, which means a minor
 release may contain breaking changes — and `v0.2.0` does.
 
-## v0.2.0 — 2026-08-06
+## v0.2.0 — 2026-08-07
 
 The first release since `v0.1.2` (January 2025). Read the breaking changes before
 upgrading, especially if you pull the `latest` tag.
