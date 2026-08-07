@@ -11,7 +11,8 @@ services:
       # The fully qualified domain name of your pfSense instance
       PFSENSE_HOSTNAME: "pfsense.lab.internal"
       
-      # API token for authenticating with pfSense. Set this in your shell or .env file.
+      # API token for authenticating with pfSense. Set this in your shell or in
+      # a .env file -- copy .env.example to .env and fill it in. Never commit it.
       PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN}"
       
       # OPTIONAL environment variables

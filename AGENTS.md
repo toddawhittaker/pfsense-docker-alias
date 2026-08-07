@@ -249,7 +249,7 @@ The reviewer enforces this by checking `git diff main...HEAD -- tests/` and conf
 - Run the compile, test, lint, and build commands above after the changes they cover.
 - Runtime dependencies are pinned in `requirements.txt`; do not introduce new ones unless explicitly approved.
 - The `Dockerfile` copies only `main.py`, `pfsense.py`, and `requirements.txt` — a new runtime module needs a matching `COPY`.
-- Keep `README.md` and `docker-compose.yaml` aligned with the actual code when env vars or labels change.
+- Keep `README.md`, `docker-compose.yaml`, and `.env.example` aligned with the actual code when env vars or labels change. All three list the settings, so a new variable that lands in only one of them is the normal way this drifts. `.env.example` is the tracked template; `.env` itself is gitignored (`.env`, `.env.*`, with `!.env.example` re-including the template) because the documentation tells operators to keep `PFSENSE_API_TOKEN` there. Do not weaken that negation — a token committed once is a token to rotate on the firewall.
 
 ## Style
 

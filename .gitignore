@@ -1,3 +1,10 @@
+# Local secrets. README and docker-compose.yaml both tell you to put
+# PFSENSE_API_TOKEN in .env, so it must never be committable. .env.example is
+# the tracked template and is deliberately re-included below.
+.env
+.env.*
+!.env.example
+
 .venv/
 .vscode/
 .claude/settings.local.json

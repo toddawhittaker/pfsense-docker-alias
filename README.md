@@ -149,7 +149,7 @@ docker run \
 
 ### Notes 📝
 
-- Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`.
+- Set `PFSENSE_API_TOKEN` in your shell or Compose `.env` file instead of hardcoding the token in `docker-compose.yaml`. Copy [`.env.example`](.env.example) to `.env` and fill it in — `docker compose` reads `.env` automatically, and `.env` is gitignored so your token cannot be committed by accident.
 - Ensure the required environment variables (`PFSENSE_HOSTNAME`, `PFSENSE_API_TOKEN`) are correctly set.
 - If using `ADD_ALIASES_ON_STARTUP`, ensure all currently running containers are labeled correctly before starting the service. Startup sync is additive and does not prune stale aliases.
 - A single container start applies right away. When several containers start at once — a `docker compose up`, or a startup scan — the changes are batched and applied in one DNS resolver reload rather than one per alias. A lone alias is therefore live in seconds, while a burst of twenty costs two reloads instead of twenty. Tune with `APPLY_QUIET_SECONDS` if your services start staggered over a longer period.
