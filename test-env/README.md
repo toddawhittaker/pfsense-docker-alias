@@ -89,6 +89,14 @@ Docker bridge address accepts the TCP connection and then carries no data, so
 the client sees a connect that succeeds followed by a read timeout. `relay.sh`
 socats the bridge address to the working loopback forward instead.
 
+**Stop the relay when you are done with it.** `smoke.sh` now does that in its
+exit trap, but if you start it by hand, run `relay.sh stop` afterwards. The
+bridge address is reachable from *every* container on the default Docker
+network, not just this service, and it forwards to a firewall that keeps
+pfSense's default `admin` / `pfsense` credentials with login protection turned
+off. Left running on a machine that also runs untrusted containers, it is a
+credential-free path to a firewall admin GUI.
+
 ## Things that bite
 
 **The lockout.** Every request from the host reaches pfSense as `10.0.3.2`, the

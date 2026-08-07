@@ -31,10 +31,23 @@ FAILURES=0
 pass() { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILURES=$(( FAILURES + 1 )); }
 
+# Containers only. This is also called mid-script to clear leftovers from an
+# earlier run, so it must not touch anything the run still needs -- notably the
+# relay, which is started before it.
 cleanup() {
   docker rm -f "$SERVICE" "$TARGET" "$EPHEMERAL" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+
+# Teardown, on exit only. The relay binds the Docker bridge address, which every
+# container on the default network can reach, and forwards to a firewall running
+# default credentials with login protection disabled. Leaving it up after the run
+# turns a test fixture into a standing credential-free path to that admin GUI on
+# any machine that also runs untrusted containers.
+on_exit() {
+  cleanup
+  "$TEST_ENV_DIR/relay.sh" stop >/dev/null 2>&1 || true
+}
+trap on_exit EXIT
 
 resolves()     { [[ -n "$(dig +short +timeout=3 "@127.0.0.1" -p "$DNS_PORT" "$1" 2>/dev/null)" ]]; }
 not_resolves() { ! resolves "$1"; }
