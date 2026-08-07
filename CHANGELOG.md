@@ -101,6 +101,13 @@ also blocks removing it.
   log line. Values are also length-capped.
 - **A pfSense API error no longer logs the response body**, which could contain data
   not intended for the log.
+- **The API token can no longer be written to the log.** If `PFSENSE_API_TOKEN` had a
+  trailing newline or a leading space — what `$(cat /run/secrets/token)` and file-based
+  Kubernetes secrets produce — `requests` rejected the header and raised an error with
+  the token embedded in its message, which was then logged in cleartext on every single
+  API call. Surrounding whitespace is now trimmed at startup, so those tokens simply
+  work; anything still malformed exits at startup naming the variable but never the
+  value; and that class of error is never logged with its message.
 - **The service survives a SIGTERM with work in flight**, flushing staged changes
   before exit.
 

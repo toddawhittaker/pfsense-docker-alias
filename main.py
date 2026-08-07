@@ -59,7 +59,26 @@ def get_positive_float_env(var_name, default):
     return value
 
 PFSENSE_HOSTNAME = get_env_var("PFSENSE_HOSTNAME")
-PFSENSE_API_TOKEN = get_env_var("PFSENSE_API_TOKEN")
+# Trim surrounding whitespace from the token. A trailing newline is what
+# `$(cat /run/secrets/token)` and a file-based Kubernetes secret both produce, and a
+# leading space is an easy compose typo. requests rejects a header value with either,
+# raising InvalidHeader with the value embedded in its message -- which is how the token
+# used to end up in the log. No API token has meaningful surrounding whitespace, so
+# trimming makes the common misconfiguration simply work instead of failing loudly with
+# a secret attached. A token malformed some other way is caught below.
+PFSENSE_API_TOKEN = get_env_var("PFSENSE_API_TOKEN").strip()
+if not PFSENSE_API_TOKEN:
+    logger.critical("PFSENSE_API_TOKEN is set but contains only whitespace.")
+    sys.exit(1)
+if any(not character.isprintable() for character in PFSENSE_API_TOKEN):
+    # Never name the value here, only the variable -- reporting a malformed secret must
+    # not print it. Trimming above has already removed surrounding whitespace, so what
+    # is left is embedded, e.g. a line break in the middle of a pasted token.
+    logger.critical(
+        "PFSENSE_API_TOKEN contains non-printable characters, such as an embedded "
+        "line break. Check how the value is being set. It is not logged."
+    )
+    sys.exit(1)
 PFSENSE_VERIFY_SSL = os.getenv("PFSENSE_VERIFY_SSL", "true").lower() != "false"
 PFSENSE_CA_BUNDLE = os.getenv("PFSENSE_CA_BUNDLE")
 if PFSENSE_CA_BUNDLE and not os.access(PFSENSE_CA_BUNDLE, os.R_OK):

@@ -222,6 +222,79 @@ def test_an_ordinary_connection_error_does_not_suggest_disabling_tls(monkeypatch
     assert "PFSENSE_VERIFY_SSL" not in caplog.text
 
 
+def test_a_token_with_a_trailing_newline_never_reaches_the_log(monkeypatch, caplog):
+    """
+    requests embeds the offending header VALUE in InvalidHeader's message.
+
+    That message is a RequestException, so it lands in _handle_api_error and would be
+    logged verbatim -- printing the firewall API token at ERROR on every call, forever,
+    because the same request fails identically every time. sanitize_for_log does not
+    help: it escapes the newline and renders the token characters as they are.
+
+    A trailing newline is the realistic case, not a contrived one. It is what
+    `$(cat /run/secrets/token)` and a file-based Kubernetes secret both produce.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise requests.exceptions.InvalidHeader(
+            "Invalid leading whitespace, reserved character(s), or return character(s) "
+            "in header value: 'SUPERSECRETTOKEN\\n'"
+        )
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "SUPERSECRETTOKEN\n")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "SUPERSECRETTOKEN" not in caplog.text
+
+
+def test_an_invalid_header_error_still_says_what_went_wrong(monkeypatch, caplog):
+    """
+    Redacting the value must not leave the operator with an unactionable log.
+
+    The whole failure is a malformed token, so the message has to name the variable
+    to check. It must do that without quoting the value it is refusing to print.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise requests.exceptions.InvalidHeader("... in header value: 'SUPERSECRETTOKEN\\n'")
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "SUPERSECRETTOKEN\n")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "PFSENSE_API_TOKEN" in caplog.text
+    assert "SUPERSECRETTOKEN" not in caplog.text
+
+
+def test_handle_api_error_survives_an_http_error_with_no_response(caplog):
+    """
+    An HTTPError carrying no response must not raise out of the error handler.
+
+    _handle_api_error runs inside an `except` block, so an AttributeError here escapes
+    _request's handler, escapes _mutate_alias's, and reaches run()'s broad handler,
+    which exits the process. That inverts the contract that a pfSense API failure logs
+    and returns False rather than killing the service.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        client._handle_api_error(  # pylint: disable=protected-access
+            requests.HTTPError("no response attached"), "ctx"
+        )
+
+    assert "no response attached" in caplog.text
+    assert "HTTP Status Code" not in caplog.text
+
+
 def test_get_all_host_overrides_returns_empty_list_on_network_errors(monkeypatch):
     def fake_get(**_kwargs):
         raise requests.ConnectionError("connection failed")
