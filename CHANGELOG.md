@@ -107,6 +107,11 @@ also blocks removing it.
 ### Changed
 
 - Base image moved from `python:3.12-alpine` to `python:3.14-alpine`.
+- **pip is removed from the runtime image.** Nothing at run time used it, and it carried
+  a vendored dependency manifest that image scanners flagged for packages unreachable
+  here — one of them, `setuptools`, was not even installed. The image now scans clean,
+  and a container that mounts the Docker socket no longer ships a package installer.
+  If you were running `pip` inside this container, it is no longer present.
 - The published image is now the exact image CI smoke-tested, rather than a rebuild
   of it, and `:latest` moves only for a plain `vX.Y.Z` tag. A pre-release such as
   `v0.3.0-rc1` publishes under its own tag and leaves `:latest` untouched, so tracking

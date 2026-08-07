@@ -85,6 +85,26 @@ jobs:
       - name: Build Docker image
         run: docker build -t pfsense-docker-alias .
 
+      # pip-audit checks only the pinned requirements files. Everything else in
+      # the image -- the Alpine layer, and whatever the base image ships -- is
+      # invisible to it, and that gap was real: this step found two HIGH
+      # findings the first time it ran, both from pip's vendored dependency
+      # manifest. The Dockerfile now removes pip after installing, so neither
+      # the installer nor its manifest is in the runtime image.
+      #
+      # ignore-unfixed is deliberate. A CVE with no available fix would block
+      # every PR with nothing the author could do about it, which is how a gate
+      # trains people to ignore CI. A *fixable* HIGH means bump the base image,
+      # which Dependabot already proposes weekly, so that one should block.
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: pfsense-docker-alias
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
       # Guards what `docker build` cannot: that the image's Python entrypoint
       # actually runs. A new runtime module missing its Dockerfile COPY builds
       # fine and fails only at import time.
