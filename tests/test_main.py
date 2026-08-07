@@ -620,6 +620,25 @@ def test_main_passes_the_ca_bundle_through(monkeypatch, tmp_path):
     assert captured["host"] == "pfsense.lab.internal"
 
 
+def test_the_shutdown_handlers_are_actually_installed(monkeypatch):
+    """
+    cleanup() is well tested; that it is REGISTERED was pinned by nothing.
+
+    No test in tests/ mentioned signal at all, so deleting either registration left the
+    whole suite green. Without them, a SIGTERM landing mid-burst terminates the process
+    immediately: cleanup() never runs, staged aliases sit in config.xml with unbound
+    never reloaded, and on an idle host nothing triggers a later apply -- the same
+    stranding failure that _record_staged(staged) and _defer_retry() were both written
+    to prevent.
+    """
+    import signal as signal_module
+
+    main, _fake_client = load_main(monkeypatch)
+
+    assert signal_module.getsignal(signal_module.SIGTERM) is main.cleanup
+    assert signal_module.getsignal(signal_module.SIGINT) is main.cleanup
+
+
 def test_cleanup_closes_client_and_exits_zero(monkeypatch):
     main, fake_client = load_main(monkeypatch)
 

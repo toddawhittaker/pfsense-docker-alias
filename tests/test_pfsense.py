@@ -9,7 +9,12 @@ class FakeResponse:
     def __init__(self, payload=None, error=None):
         self.payload = payload or {}
         self.error = error
-        self.status_code = 500
+        # 200, because this stands in for a SUCCESSFUL response. It used to default to
+        # 500, which meant no test ever put a 2xx through _request -- so the redirect
+        # guard's `300 <= status_code < 400` boundary was only ever exercised against a
+        # server error. A fixture that models success with a failure status is the same
+        # shape of lie as the single-domain override list.
+        self.status_code = 200
         self.text = "failure"
         # Real requests.Response has this; _request checks it, because a redirect must
         # fail the call rather than be mistaken for a successful mutation.
@@ -25,6 +30,7 @@ class FakeResponse:
 
 def http_error():
     response = FakeResponse()
+    response.status_code = 500
     error = requests.HTTPError("request failed")
     error.response = response
     return error
@@ -153,6 +159,7 @@ def test_get_all_host_overrides_returns_empty_list_on_request_errors(monkeypatch
 
 def test_http_error_logs_status_without_response_body(monkeypatch, caplog):
     response = FakeResponse()
+    response.status_code = 500
     response.text = "sensitive response body"
     error = requests.HTTPError("request failed")
     error.response = response
@@ -461,7 +468,39 @@ def test_handle_api_error_survives_an_http_error_with_no_response(caplog):
     assert "HTTP Status Code" not in caplog.text
 
 
+def test_request_waits_between_retries(monkeypatch):
+    """
+    The back-off is the whole point of retrying, and it was unpinned.
+
+    Replacing it with `pass` left all 181 tests green -- while the suite was already
+    PAYING for it: the network-errors test below did not stub time.sleep, so it slept a
+    real 2.00s out of a 2.17s suite without ever observing the delay. Counting the
+    stubbed calls pins it and takes the suite to ~0.3s.
+
+    Failure scenario without it: pfSense restarts its webConfigurator, or an unbound
+    reload briefly refuses connections -- a one-to-three second window. Today attempt 1
+    fails, the service waits, attempt 2 or 3 succeeds, and the alias is created. Firing
+    all three attempts at the same instant of the same refused connection means the
+    alias is simply never created.
+    """
+    slept = []
+    monkeypatch.setattr("pfsense.time.sleep", slept.append)
+
+    def fake_get(**_kwargs):
+        raise requests.ConnectionError("connection failed")
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    assert client.get_all_host_overrides() == []
+
+    # One wait between each failed attempt and the next: attempts - 1.
+    assert slept == [1] * (pfsense.API_REQUEST_ATTEMPTS - 1)
+
+
 def test_get_all_host_overrides_returns_empty_list_on_network_errors(monkeypatch):
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
     def fake_get(**_kwargs):
         raise requests.ConnectionError("connection failed")
 
@@ -820,6 +859,23 @@ def test_redaction_runs_before_sanitizing(monkeypatch, caplog):
 
     # No run of the token long enough to be recognisable may survive.
     assert "T" * 20 not in caplog.text
+
+
+def test_a_two_label_fqdn_is_accepted(monkeypatch):
+    """
+    The documented minimum is two labels, and only the REJECTION side was covered.
+
+    Every FQDN the suite accepted had three or more labels, so loosening the guard from
+    `< 2` to `<= 2` left all 181 tests green. That mutant rejects every name on a flat
+    domain -- pfSense's own default `localdomain`, or a `.lan` / `.home` network -- with
+    "Invalid FQDN", creating no aliases at all while the service looks healthy.
+    """
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    assert client._split_fqdn("nginx.lan", "unit") == ("nginx", "lan")
+    assert client._split_fqdn("caddy.localdomain", "unit") == ("caddy", "localdomain")
+    # One label is still not enough.
+    assert client._split_fqdn("nginx", "unit") is None
 
 
 def test_a_valid_fqdn_does_reach_the_api(monkeypatch):
@@ -1602,7 +1658,9 @@ def test_the_apply_poll_waits_between_attempts(monkeypatch):
     assert client.apply_changes() is True
 
     # One wait between each unsuccessful poll and the next attempt.
-    assert slept == [pfsense.APPLY_POLL_DELAY_SECONDS] * 4
+    # A literal, not the constant: asserting against APPLY_POLL_DELAY_SECONDS would
+    # still pass if it were set to 0, which is the one value that breaks the poll.
+    assert slept == [1] * 4
 
 
 # --- Two domains, so a host match can be told from a host-and-domain match --------
@@ -2026,6 +2084,9 @@ def test_api_error_log_cannot_forge_a_log_record(monkeypatch, caplog):
     """
     hostile = "upstream said: boom\n2026-08-02 12:00:00 - INFO - forged"
     response = FakeResponse()
+    # Set explicitly: FakeResponse defaults to 200 because it models a success. An
+    # error response has to say so.
+    response.status_code = 500
     error = requests.HTTPError(hostile)
     error.response = response
 
