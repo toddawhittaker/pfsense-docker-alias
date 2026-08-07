@@ -26,6 +26,13 @@ PFSENSE_IMAGE_SHA256="bc3ee3d82b8195387114a64c3398505f238a6cb5393ae9b2d45d1bf940
 RESTAPI_VERSION="v2.4.3"
 RESTAPI_PKG="pfSense-${PFSENSE_VERSION}-pkg-RESTAPI.pkg"
 RESTAPI_URL="https://github.com/pfrest/pfSense-pkg-RESTAPI/releases/download/${RESTAPI_VERSION}/${RESTAPI_PKG}"
+# bootstrap.sh installs this package as root inside the VM, so pin it like the
+# pfSense image above. A GitHub release asset is mutable -- the publisher can
+# replace it without moving the tag -- so the version alone is not an immutable
+# reference. Take the hash from the asset's `digest` field, which GitHub computes:
+#   gh api repos/pfrest/pfSense-pkg-RESTAPI/releases/tags/$RESTAPI_VERSION \
+#     --jq '.assets[] | select(.name == "'"$RESTAPI_PKG"'") | .digest'
+RESTAPI_SHA256="69f84530890c62dc0209e188af3f697fa1952b9de532720cfc6e3ebe42331438"
 
 # Guest addressing. The LAN address is fixed because QEMU's port forwarding
 # rules name it explicitly.
@@ -45,7 +52,7 @@ DNS_PORT="15353"
 BRIDGE_IP="172.17.0.1"
 
 export PFSENSE_VERSION PFSENSE_IMAGE PFSENSE_IMAGE_URL PFSENSE_IMAGE_SHA256
-export RESTAPI_VERSION RESTAPI_PKG RESTAPI_URL
+export RESTAPI_VERSION RESTAPI_PKG RESTAPI_URL RESTAPI_SHA256
 export LAN_IP LAN_GATEWAY PARENT_HOST PARENT_DOMAIN PARENT_IP
 export API_PORT SSH_PORT DNS_PORT BRIDGE_IP
 

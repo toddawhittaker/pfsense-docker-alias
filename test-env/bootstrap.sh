@@ -142,6 +142,8 @@ if [[ ! -f "$PFSENSE_IMAGE" ]]; then
 fi
 
 [[ -f "$RESTAPI_PKG" ]] || "${CURL[@]}" -o "$RESTAPI_PKG" "$RESTAPI_URL"
+echo "$RESTAPI_SHA256  $RESTAPI_PKG" | sha256sum -c - \
+  || die "checksum mismatch on $RESTAPI_PKG — delete it and retry"
 
 log "creating a 20 GB disk"
 qemu-img create -f qcow2 "$DISK" 20G >/dev/null
