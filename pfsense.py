@@ -207,11 +207,44 @@ class PFSense:
         """
         for attempt in range(1, attempts + 1):
             try:
-                return method(**kwargs)
+                # allow_redirects=False is a security control, not a preference.
+                # requests strips only the `Authorization` header when a redirect
+                # crosses to another host; every other header is re-sent, and this
+                # service authenticates with a custom `X-API-Key`. A 302 from the
+                # firewall's web tier would therefore hand a live firewall credential
+                # to whatever host the Location names -- including a plain `http://`
+                # one, in cleartext, even with verification enabled, because the
+                # downgrade happens after the handshake with the original host.
+                #
+                # Every endpoint here is an exact /api/v2/... path. Nothing legitimate
+                # redirects, so a redirect is an anomaly to fail on, not to follow.
+                response = method(allow_redirects=False, **kwargs)
+                if response.is_redirect:
+                    # Not following it is only half the job: raise_for_status() treats
+                    # 3xx as success, so a redirect would otherwise be recorded as a
+                    # landed mutation -- setting unapplied_changes for a change that
+                    # never reached pfSense. Fail the call instead, and do not retry:
+                    # a redirect is a misconfiguration, not a transient fault.
+                    logger.error(
+                        f"API call during '{context}' was redirected. pfSense's API "
+                        "does not redirect, and following it would send the API token "
+                        "to the new location, so the call was abandoned. Check for a "
+                        "proxy or captive portal in front of the firewall."
+                    )
+                    return None
+                return response
             # OSError, not just RequestException: requests raises a bare OSError when
             # `verify` names an unreadable CA bundle. Letting that escape crash-looped
             # the container, which pushed operators toward disabling verification.
-            except (requests.RequestException, OSError) as e:
+            #
+            # ValueError for the same reason one level down: http.client raises
+            # UnicodeEncodeError -- a ValueError, not a RequestException -- when a
+            # header will not encode as latin-1. That escaped every handler up to
+            # run(), which exits the process, inverting the contract that an API
+            # failure logs and returns False. The read path already caught ValueError,
+            # which is the only reason this was not reachable in practice; the mutation
+            # and apply paths must not catch strictly less than it.
+            except (requests.RequestException, OSError, ValueError) as e:
                 if attempt == attempts:
                     self._handle_api_error(e, context)
                     return None
@@ -306,12 +339,15 @@ class PFSense:
         :param error: The exception raised during the API call.
         :param context: Additional context about the API call.
         """
-        if isinstance(error, requests.exceptions.InvalidHeader):
-            # Do NOT log this exception's message. requests embeds the offending header
-            # value in it, and the only header this service sets is the API token, so
-            # logging the message prints the token in cleartext -- on every call, since
-            # the request fails identically each time. sanitize_for_log does not save
-            # us here: it escapes the newline and renders the token characters as-is.
+        if isinstance(error, (requests.exceptions.InvalidHeader, UnicodeEncodeError)):
+            # Do NOT log either exception's message. Both embed part of the offending
+            # header value, and the only header this service sets is the API token.
+            # requests' InvalidHeader quotes the whole value; http.client's
+            # UnicodeEncodeError, raised when a header will not encode as latin-1,
+            # names the offending character and its index. Logging either prints token
+            # material in cleartext -- on every call, since the request fails
+            # identically each time. sanitize_for_log does not save us: it escapes the
+            # newline and renders the token characters as they are.
             #
             # main.py trims surrounding whitespace from the token so the common causes
             # (a file-based secret, `$(cat ...)`) never reach this branch at all. This

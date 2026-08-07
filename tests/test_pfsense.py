@@ -11,6 +11,9 @@ class FakeResponse:
         self.error = error
         self.status_code = 500
         self.text = "failure"
+        # Real requests.Response has this; _request checks it, because a redirect must
+        # fail the call rather than be mistaken for a successful mutation.
+        self.is_redirect = False
 
     def json(self):
         return self.payload
@@ -33,10 +36,14 @@ def applied_status_get(applied=True, calls=None):
 
     The signature is explicit rather than `**_kwargs` on purpose. A helper that swallows
     every kwarg swallowed a hardcoded `verify=False` in _changes_applied() too — mutation
-    testing proved the whole suite stayed green. Naming the four kwargs turns a *dropped*
+    testing proved the whole suite stayed green. Naming the kwargs turns a *dropped*
     one into a TypeError at every call site; pass `calls` to catch a *weakened* one.
+
+    `allow_redirects` is named here for the same reason as `verify`: it is a security
+    control, not a preference. Dropping it would let a redirect carry the API token to
+    another host, so it must not be silently absorbed by a catch-all signature.
     """
-    def fake_get(url, headers, verify, timeout):
+    def fake_get(url, headers, verify, timeout, allow_redirects):
         if calls is not None:
             calls.append(
                 {
@@ -74,7 +81,7 @@ def assert_no_forged_log_records(caplog):
 def test_get_all_host_overrides_constructs_request(monkeypatch):
     calls = []
 
-    def fake_get(url, headers, verify, timeout):
+    def fake_get(url, headers, verify, timeout, allow_redirects):
         calls.append(
             {
                 "url": url,
@@ -106,7 +113,7 @@ def test_get_all_host_overrides_constructs_request(monkeypatch):
 def test_get_all_host_overrides_uses_custom_ca_bundle(monkeypatch):
     calls = []
 
-    def fake_get(url, headers, verify, timeout):
+    def fake_get(url, headers, verify, timeout, allow_redirects):
         calls.append({"verify": verify})
         return FakeResponse({"data": []})
 
@@ -121,7 +128,7 @@ def test_get_all_host_overrides_uses_custom_ca_bundle(monkeypatch):
 def test_get_all_host_overrides_can_disable_tls_verification(monkeypatch):
     calls = []
 
-    def fake_get(url, headers, verify, timeout):
+    def fake_get(url, headers, verify, timeout, allow_redirects):
         calls.append({"verify": verify})
         return FakeResponse({"data": []})
 
@@ -220,6 +227,124 @@ def test_an_ordinary_connection_error_does_not_suggest_disabling_tls(monkeypatch
 
     assert "PFSENSE_CA_BUNDLE" not in caplog.text
     assert "PFSENSE_VERIFY_SSL" not in caplog.text
+
+
+def test_requests_never_follow_redirects(monkeypatch):
+    """
+    Redirects must not be followed, because the API token would follow them.
+
+    requests strips only the `Authorization` header on a cross-host redirect. Every
+    other header is re-sent, and this service authenticates with a custom `X-API-Key`
+    -- so a 302 from the firewall's web tier hands a live firewall credential to
+    whatever host the Location names, including a plain `http://` one, and it does that
+    even with PFSENSE_VERIFY_SSL=true because the downgrade happens after the TLS
+    handshake with the original host.
+
+    Every endpoint this service calls is an exact /api/v2/... path. Nothing legitimate
+    redirects, so a redirect is already an anomaly worth failing on rather than
+    chasing.
+    """
+    seen = []
+
+    def record(**kwargs):
+        seen.append(kwargs.get("allow_redirects"))
+        return FakeResponse({"data": []})
+
+    monkeypatch.setattr("pfsense.requests.get", record)
+    monkeypatch.setattr("pfsense.requests.post", record)
+    monkeypatch.setattr("pfsense.requests.delete", record)
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides()
+    client.apply_changes()
+
+    assert seen, "no requests were made"
+    assert all(value is False for value in seen), seen
+
+
+def test_a_redirect_is_treated_as_a_failure_not_a_success(monkeypatch, caplog):
+    """
+    Refusing to follow a redirect is not enough on its own.
+
+    raise_for_status() only raises for 4xx and 5xx, so a 302 would sail through as
+    success -- and a mutation would then set unapplied_changes and increment
+    change_count for a change that never reached pfSense, leaving the coalescer
+    retrying an apply for work that does not exist. A redirect must fail the request.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    class Redirect(FakeResponse):
+        def __init__(self):
+            super().__init__({})
+            self.status_code = 302
+            self.is_redirect = True
+
+    monkeypatch.setattr("pfsense.requests.post", lambda **_kwargs: Redirect())
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+    client.get_all_host_overrides = lambda: [
+        {"id": 12, "host": "caddy", "domain": "lab.internal", "aliases": []}
+    ]
+
+    with caplog.at_level(logging.ERROR):
+        assert client.add_host_override_alias("caddy.lab.internal", "n.lab.internal") is False
+
+    assert client.unapplied_changes is False
+    assert client.change_count == 0
+    assert "redirect" in caplog.text.lower()
+
+
+def test_a_header_encoding_error_does_not_leak_the_token(monkeypatch, caplog):
+    """
+    http.client encodes header values as latin-1 and names the offending character.
+
+    A token containing a printable non-latin-1 character clears the startup check --
+    isprintable() is true for it -- and clears requests' own validator, then fails deep
+    in http.client with a message naming a character OF THE TOKEN and its exact index.
+    Logged verbatim it is a partial disclosure, repeated on every retry and every
+    container event. Same shape as the InvalidHeader leak, different exception.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise UnicodeEncodeError(
+            "latin-1", "SUPERSECRET€TOKEN", 11, 12, "ordinal not in range(256)"
+        )
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "SUPERSECRET€TOKEN")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    assert "SUPERSECRET" not in caplog.text
+    assert "PFSENSE_API_TOKEN" in caplog.text
+
+
+def test_a_value_error_in_a_mutation_does_not_escape(monkeypatch, caplog):
+    """
+    The mutation and apply paths must catch what the read path catches.
+
+    _request's except tuple did not include ValueError, so a UnicodeEncodeError raised
+    inside http.client escaped it, escaped _mutate_alias, and reached run()'s broad
+    handler -- which exits the process. That inverts the contract that an API failure
+    logs and returns False rather than killing the service. The read path already
+    caught it, which is the only reason this was not reachable in practice.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def exploding(**_kwargs):
+        raise UnicodeEncodeError("latin-1", "tok", 0, 1, "ordinal not in range(256)")
+
+    monkeypatch.setattr("pfsense.requests.post", exploding)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        # Must return False, not raise.
+        assert client.apply_changes() is False
 
 
 def test_a_token_with_a_trailing_newline_never_reaches_the_log(monkeypatch, caplog):
@@ -342,7 +467,7 @@ def test_get_all_host_overrides_returns_empty_list_on_invalid_json(monkeypatch):
 def test_add_host_override_alias_constructs_alias_and_apply_requests(monkeypatch):
     calls = []
 
-    def fake_post(url, headers, verify, timeout, json=None):
+    def fake_post(url, headers, verify, timeout, allow_redirects, json=None):
         calls.append(
             {
                 "url": url,
@@ -537,7 +662,7 @@ def test_del_host_override_alias_constructs_delete_and_apply_requests(monkeypatc
     delete_calls = []
     post_calls = []
 
-    def fake_delete(url, headers, verify, timeout, json=None):
+    def fake_delete(url, headers, verify, timeout, allow_redirects, json=None):
         delete_calls.append(
             {
                 "url": url,
@@ -549,7 +674,7 @@ def test_del_host_override_alias_constructs_delete_and_apply_requests(monkeypatc
         )
         return FakeResponse()
 
-    def fake_post(url, headers, verify, timeout, json=None):
+    def fake_post(url, headers, verify, timeout, allow_redirects, json=None):
         post_calls.append(
             {
                 "url": url,
@@ -1474,7 +1599,7 @@ def test_a_maximal_length_fqdn_reaches_the_payload_byte_for_byte(monkeypatch, ca
     """
     posts = []
 
-    def fake_post(url, headers, verify, timeout, json=None):
+    def fake_post(url, headers, verify, timeout, allow_redirects, json=None):
         posts.append({"url": url, "json": json})
         return FakeResponse()
 
@@ -1818,7 +1943,7 @@ def test_an_oversized_description_is_truncated_in_the_payload_not_rejected(monke
     """
     posts = []
 
-    def fake_post(url, headers, verify, timeout, json=None):
+    def fake_post(url, headers, verify, timeout, allow_redirects, json=None):
         posts.append({"url": url, "json": json})
         return FakeResponse()
 
@@ -1851,7 +1976,7 @@ def test_a_hostile_description_cannot_forge_a_log_record_or_reach_the_payload_ra
     """
     posts = []
 
-    def fake_post(url, headers, verify, timeout, json=None):
+    def fake_post(url, headers, verify, timeout, allow_redirects, json=None):
         posts.append({"url": url, "json": json})
         return FakeResponse()
 
@@ -1956,7 +2081,7 @@ def test_the_description_cap_warning_reports_the_enforced_cap(monkeypatch, caplo
     """
     posts = []
 
-    def fake_post(url, headers, verify, timeout, json=None):
+    def fake_post(url, headers, verify, timeout, allow_redirects, json=None):
         posts.append({"url": url, "json": json})
         return FakeResponse()
 
