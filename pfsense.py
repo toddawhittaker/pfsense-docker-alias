@@ -63,6 +63,19 @@ logger = logging.getLogger(__name__)
 
 API_REQUEST_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
+
+# One tuple for every handler that wraps an API call, so no path can catch strictly
+# less than another. AGENTS.md used to state that as a rule and the code did not hold
+# it: four handlers had four different tuples, and the narrowest caught only
+# RequestException. Nothing was live -- _request normalises everything below these --
+# but a rule stated in prose and contradicted by the source is worse than no rule.
+#
+# Each member earns its place. OSError: requests raises a bare one when `verify` names
+# an unreadable CA bundle. ValueError: http.client raises UnicodeEncodeError, a
+# ValueError, when a header will not encode as latin-1, and json() raises
+# JSONDecodeError, also a ValueError. AttributeError: a malformed response body makes
+# .get() calls fail on a non-dict.
+API_ERRORS = (requests.RequestException, OSError, ValueError, AttributeError)
 # Applying is asynchronous: the POST returns before unbound has finished
 # reloading, so confirm with a bounded GET poll rather than fire-and-forget.
 APPLY_POLL_ATTEMPTS = 15
@@ -251,7 +264,7 @@ class PFSense:
             # failure logs and returns False. The read path already caught ValueError,
             # which is the only reason this was not reachable in practice; the mutation
             # and apply paths must not catch strictly less than it.
-            except (requests.RequestException, OSError, ValueError) as e:
+            except API_ERRORS as e:
                 if attempt == attempts:
                     self._handle_api_error(e, context)
                     return None
@@ -299,7 +312,7 @@ class PFSense:
             if response is None:
                 return False
             response.raise_for_status()
-        except requests.RequestException as e:
+        except API_ERRORS as e:
             self._handle_api_error(e, "apply_changes")
             return False
 
@@ -336,7 +349,7 @@ class PFSense:
             response.raise_for_status()
             data = response.json().get('data', {})
             return data.get('applied') is True
-        except (requests.RequestException, ValueError, AttributeError) as e:
+        except API_ERRORS as e:
             self._handle_api_error(e, "apply_changes_status")
             return False
 
@@ -427,7 +440,7 @@ class PFSense:
                 return []
             response.raise_for_status()
             data = response.json().get('data', [])
-        except (requests.RequestException, OSError, ValueError, AttributeError) as e:
+        except API_ERRORS as e:
             self._handle_api_error(e, "get_all_host_overrides")
             return []
 
@@ -519,7 +532,7 @@ class PFSense:
                 return False
             response.raise_for_status()
 
-        except (requests.RequestException, OSError) as e:
+        except API_ERRORS as e:
             self._handle_api_error(e, context)
             return False
 
