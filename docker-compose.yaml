@@ -15,7 +15,9 @@ services:
       PFSENSE_API_TOKEN: "${PFSENSE_API_TOKEN}"
       
       # OPTIONAL environment variables
-      # Set to "false" only if you cannot validate your pfSense certificate
+      # TLS certificate verification is ON by default. Set this to "false" only
+      # if you cannot validate your pfSense certificate -- doing so exposes the
+      # API token to anyone able to intercept the connection.
       # PFSENSE_VERIFY_SSL: "true"
       #
       # Path inside the container to a custom CA bundle for pfSense TLS validation
