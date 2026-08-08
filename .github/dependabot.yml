@@ -23,6 +23,21 @@ updates:
       prefix: chore
     labels:
       - dependencies
+    groups:
+      # The two halves of the build-once guarantee: the publish job ships the
+      # exact artifact the test job uploaded. Both steps are gated on a tag ref,
+      # so pull-request CI skips them and a bump to either action goes green
+      # having run none of its own change -- the first thing to exercise it is a
+      # release. Grouping keeps them from being merged apart and leaving the
+      # pipeline mismatched with nothing able to notice.
+      #
+      # No update-types key on purpose: omitting it groups every SemVer level,
+      # and the bumps that made this necessary (upload v4->v7, download v4->v8)
+      # were both majors.
+      artifact-actions:
+        patterns:
+          - "actions/upload-artifact"
+          - "actions/download-artifact"
 
   # Base image (python:3.14-alpine) rebuilds.
   - package-ecosystem: docker
