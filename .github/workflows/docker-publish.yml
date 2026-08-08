@@ -166,7 +166,7 @@ jobs:
       # No checkout and no build: this job publishes the artifact the test job
       # produced, and must not construct an image of its own.
       - name: Download tested image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: tested-image
           path: ${{ runner.temp }}
