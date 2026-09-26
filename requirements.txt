@@ -3,4 +3,4 @@ charset-normalizer==3.5.1
 docker==7.2.0
 idna==3.20
 requests==2.34.2
-urllib3==2.7.0
+urllib3==2.8.0
