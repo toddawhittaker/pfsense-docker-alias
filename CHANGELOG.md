@@ -3,6 +3,46 @@
 This project uses semantic versioning. It is still on `0.x`, which means a minor
 release may contain breaking changes — and `v0.2.0` does.
 
+## v0.2.1 — 2026-11-01
+
+A maintenance release. There are no code or configuration changes, so upgrading from
+`v0.2.0` needs no action.
+
+### Brotli (CVE-2026-111497, "Node2Shell" / "HTTP2Shell")
+
+**This service is not affected, and never has been.** CVE-2026-111497 is a flaw in
+Google's Brotli decompression library. We checked this project and its published
+images and found the following:
+
+- Neither Python Brotli package (`brotli` or `brotlicffi`) is installed, directly or
+  as a dependency of a dependency.
+- The HTTP library (`urllib3`) only asks pfSense for `gzip`, `deflate` or `zstd`
+  compression, so it never receives Brotli data to decode.
+- A full filesystem search of the `v0.2.1`, `v0.2.0` and `v0.1.2` images finds no
+  Brotli library of any kind.
+
+If you run a scanner across your hosts, this image should not appear in its Brotli
+results. If it does, please open an issue.
+
+### Updated dependencies
+
+Every runtime dependency is on its latest release, and the image is rebuilt on the
+current `python:3.14-alpine` base (Python 3.14.10).
+
+| Package | v0.2.0 | v0.2.1 |
+|---|---|---|
+| certifi (the trusted certificate list) | 2026.7.22 | 2026.10.23 |
+| charset-normalizer | 3.4.9 | 3.5.2 |
+| idna | 3.18 | 3.20 |
+| urllib3 | 2.7.0 | 2.8.0 |
+| docker | 7.2.0 | unchanged |
+| requests | 2.34.2 | unchanged |
+
+### Project housekeeping
+
+- Dependabot alerts and security updates are now enabled for this repository, in
+  addition to the weekly version updates it already had.
+
 ## v0.2.0 — 2026-08-07
 
 The first release since `v0.1.2` (January 2025). Read the breaking changes before
