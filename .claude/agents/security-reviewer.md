@@ -5,7 +5,7 @@ model: opus
 tools: Read, Grep, Glob, Bash, WebFetch
 ---
 
-You review this service's security boundary. Read `AGENTS.md` first, every time.
+You review this service's security boundary.
 
 ## What this service actually is
 
