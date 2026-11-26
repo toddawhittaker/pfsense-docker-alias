@@ -31,7 +31,7 @@ test-env/smoke.sh            # run the service against it and assert end to end
 test-env/smoke.sh --reset    # from the clean snapshot, for a repeatable run
 
 test-env/vm.sh start         # boot it
-test-env/vm.sh reset         # roll back to the clean snapshot, about a second
+test-env/vm.sh reset         # roll back to the clean snapshot and set the clock, a few seconds
 test-env/vm.sh stop          # shut it down
 test-env/vm.sh status
 
@@ -109,6 +109,16 @@ off pfRest's own login protection. If you still manage to trip it:
 ```bash
 PFSENSE_LAB_DIR=... python3 test-env/lib/sendkeys.py "pfctl -t sshguard -T flush{ENTER}"
 ```
+
+**A restored snapshot has a stale clock.** `loadvm` restores the guest's clock
+with everything else, so after a rollback pfSense believes it is still the day
+the snapshot was taken. pfSense runs `unbound-anchor` on every DNS resolver
+apply, and with a clock months out it cannot validate the root trust anchor: it
+hangs for about thirty seconds and fails, and unbound stays down for a minute or
+more per apply. The service's apply poll then gives up, DNS queries time out, and
+`smoke.sh` fails at random on code that is fine. `vm.sh reset` sets the guest
+clock from the host after rolling back, so use it rather than a bare
+`vm.sh monitor loadvm`.
 
 **`--rm` containers were the first real bug this environment found.** Docker can
 delete a container started with `--rm` before its stop event is handled, so its
