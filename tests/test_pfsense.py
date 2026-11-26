@@ -236,6 +236,45 @@ def test_an_ordinary_connection_error_does_not_suggest_disabling_tls(monkeypatch
     assert "PFSENSE_VERIFY_SSL" not in caplog.text
 
 
+def test_a_tls_failure_that_is_not_about_the_certificate_does_not_suggest_disabling_tls(
+    monkeypatch, caplog
+):
+    """
+    Not every SSLError is a certificate problem, and the hint must say only what is true.
+
+    A connection that is accepted and then dropped mid-handshake -- a proxy or relay
+    whose backend is down, a firewall still booting -- raises SSLError wrapping
+    SSLEOFError. The hint used to fire for that too, telling an operator that
+    certificate verification had failed and that they could set PFSENSE_VERIFY_SSL=false,
+    even when verification was already off. That is the unreachable-host case the test
+    above guards, arriving through the SSLError door instead of ConnectionError.
+
+    The message below is the one requests really produces, captured against a socket
+    that accepts and closes.
+    """
+    monkeypatch.setattr("pfsense.time.sleep", lambda _seconds: None)
+
+    def fake_get(**_kwargs):
+        raise requests.exceptions.SSLError(
+            "HTTPSConnectionPool(host='172.17.0.1', port=8443): Max retries exceeded "
+            "with url: /api/v2/services/dns_resolver/host_overrides (Caused by "
+            "SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred "
+            "in violation of protocol (_ssl.c:1147)')))"
+        )
+
+    monkeypatch.setattr("pfsense.requests.get", fake_get)
+
+    client = PFSense("pfsense.lab.internal", "secret-token")
+
+    with caplog.at_level(logging.ERROR):
+        assert client.get_all_host_overrides() == []
+
+    # The underlying error is still logged; only the misleading advice is gone.
+    assert "UNEXPECTED_EOF_WHILE_READING" in caplog.text
+    assert "PFSENSE_CA_BUNDLE" not in caplog.text
+    assert "PFSENSE_VERIFY_SSL" not in caplog.text
+
+
 def test_requests_never_follow_redirects(monkeypatch):
     """
     Redirects must not be followed, because the API token would follow them.

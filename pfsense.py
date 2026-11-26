@@ -409,7 +409,9 @@ class PFSense:
             # handler up to run() and exit the process -- inverting the contract that an
             # API failure logs and returns False rather than killing the service.
             logger.error(f"HTTP Status Code: {error.response.status_code}")
-        if isinstance(error, requests.exceptions.SSLError):
+        if isinstance(error, requests.exceptions.SSLError) and (
+            "certificate verify failed" in str(error)
+        ):
             # requests reports the cause accurately but names nothing an operator can
             # set. Verification defaults to on, which this service did not always do,
             # so someone upgrading has no reason to know these settings exist.
@@ -417,6 +419,13 @@ class PFSense:
             # Deliberately SSLError and not its ConnectionError parent: advice to
             # consider switching verification off must not appear every time the host
             # is simply unreachable. A test pins that boundary.
+            #
+            # And only an SSLError that is about the certificate. A handshake dropped
+            # mid-way (SSLEOFError, from a proxy whose backend is down) is the same
+            # unreachable-host case arriving as an SSLError, and used to get this hint
+            # even with verification already off. OpenSSL words every verification
+            # failure -- untrusted issuer, expiry, hostname mismatch -- as "certificate
+            # verify failed", and requests carries that text through.
             logger.error(
                 "TLS certificate verification failed. Mount a CA bundle and set "
                 "PFSENSE_CA_BUNDLE to its path inside the container, or set "
