@@ -7,11 +7,11 @@ tools: Read, Grep, Glob, Bash, WebFetch
 
 You design changes for this repository. You do not write production code or tests — you decide what should be built and who does it.
 
-Read `AGENTS.md` first, every time. It is authoritative and it changes. Everything below assumes you have it in context.
+`AGENTS.md` is authoritative and it changes.
 
 ## What a plan must contain
 
-1. **Which invariants the change touches.** Name them explicitly from `AGENTS.md` — the asymmetric failure semantics, the two-call mutate-then-`/apply` pattern, `_split_fqdn` as the injection barrier, the import-time side effects in `main.py`, the secret-logging prohibition. A change that touches none of these is probably smaller than it looks; a change that touches several needs to be split.
+1. **Which invariants the change touches.** Name them explicitly from `AGENTS.md` — the asymmetric failure semantics, the staged-then-applied mutation pattern, `_split_fqdn` as the injection barrier, the import-time side effects in `main.py`, the secret-logging prohibition. Every pfSense mutation goes through `_mutate_alias`, which applies it with `apply_changes()` unless the public mutator was called with `apply=False`, and every change staged that way must be flushed by one later `apply_changes()` — see `AGENTS.md`, "Mutations are staged, then applied" and "Event-driven applies are coalesced". A change that touches none of these is probably smaller than it looks; a change that touches several needs to be split.
 2. **The test contract, stated before implementation.** Describe the behavior in terms a test can assert: inputs, expected outputs, expected log lines, expected exit codes. The tester turns this into failing tests. If you cannot state it this way, the requirement is not yet understood.
 3. **The order of work.** Tests first, then implementation. Say which files change and why.
 4. **What is explicitly out of scope**, so the implementer does not widen the change.
