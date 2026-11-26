@@ -1,8 +1,11 @@
 import importlib
 import logging
+import shutil
 import sys
 import time
 import types
+
+import certifi
 
 import pfsense
 
@@ -460,6 +463,63 @@ def test_import_exits_when_the_ca_bundle_is_not_readable(monkeypatch, caplog, tm
     assert "test-token" not in capsys.readouterr().err
 
 
+def write_real_ca_bundle(path):
+    """
+    Write a CA bundle that actually parses, by copying certifi's.
+
+    These tests used to write placeholder text, which was fine while startup only
+    checked that the file was readable. It now also checks that the file loads as a
+    CA bundle, so a test that means "a good bundle" has to use one.
+    """
+    shutil.copyfile(certifi.where(), path)
+
+
+def test_import_exits_when_the_ca_bundle_is_not_a_certificate_bundle(
+    monkeypatch, caplog, tmp_path, capsys
+):
+    """
+    A readable PFSENSE_CA_BUNDLE that does not parse must also fail at startup.
+
+    Readability alone let a wrong file through -- an empty file, a private key, a
+    certificate in DER form, the wrong file mounted at the right path. The service
+    then started, and every request failed with an SSLError that names no setting,
+    while the operator had every reason to believe the bundle was in place. Loading
+    the bundle with the same OpenSSL that will use it catches all of these before the
+    first request.
+    """
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-- not a real certificate --\n")
+
+    with caplog.at_level(logging.CRITICAL):
+        try:
+            load_main(monkeypatch, ca_bundle=str(bundle))
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("import did not exit")
+
+    critical = [m for m in log_messages(caplog) if "could not be loaded" in m]
+    assert len(critical) == 1
+    assert str(bundle) in critical[0]
+    assert "PEM" in critical[0]
+    # Distinct from the unreadable case, so the operator knows the mount worked.
+    assert "is not readable" not in caplog.text
+    assert "test-token" not in caplog.text
+    assert "test-token" not in capsys.readouterr().err
+
+
+def test_a_ca_bundle_directory_is_not_parsed_as_a_file(monkeypatch, tmp_path):
+    """
+    requests also accepts a directory of hashed certificates for `verify`.
+
+    Loading a directory as a bundle file would fail, so the parse check must apply
+    to files only; a directory keeps the readability check alone.
+    """
+    main, _fake_client = load_main(monkeypatch, ca_bundle=str(tmp_path))
+
+    assert main.PFSENSE_CA_BUNDLE == str(tmp_path)
+
+
 def test_a_readable_ca_bundle_starts_normally(monkeypatch, tmp_path):
     """
     The startup check rejects an *unreadable* bundle, not the mere presence of one.
@@ -468,7 +528,7 @@ def test_a_readable_ca_bundle_starts_normally(monkeypatch, tmp_path):
     above green while making every custom CA bundle fatal.
     """
     bundle = tmp_path / "ca.pem"
-    bundle.write_text("-- not a real certificate --\n")
+    write_real_ca_bundle(bundle)
 
     main, _fake_client = load_main(monkeypatch, verify_ssl="false", ca_bundle=str(bundle))
 
@@ -610,7 +670,7 @@ def test_main_wires_the_client_from_the_environment(monkeypatch):
 def test_main_passes_the_ca_bundle_through(monkeypatch, tmp_path):
     """The bundle must reach the client; main must not drop it."""
     bundle = tmp_path / "ca.pem"
-    bundle.write_text("-- not a real certificate --\n")
+    write_real_ca_bundle(bundle)
     main, _fake_client = load_main(monkeypatch, verify_ssl="false", ca_bundle=str(bundle))
 
     captured = _capture_client(monkeypatch, main)

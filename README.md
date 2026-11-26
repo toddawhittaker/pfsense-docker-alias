@@ -219,7 +219,7 @@ Use these environment variables in your `docker-compose.yaml` or `docker run` co
 | `PFSENSE_HOSTNAME`       | Yes      | None    | Fully qualified domain name of your pfSense instance. |
 | `PFSENSE_API_TOKEN`      | Yes      | None    | API token for authenticating with pfSense.            |
 | `PFSENSE_VERIFY_SSL`     | No       | `true`  | Validate the pfSense HTTPS certificate. Set to `false` only if certificate validation is not possible. |
-| `PFSENSE_CA_BUNDLE`      | No       | None    | Path inside the container to a custom CA bundle for pfSense certificate validation. |
+| `PFSENSE_CA_BUNDLE`      | No       | None    | Path inside the container to a custom CA bundle for pfSense certificate validation: a PEM file holding the CA that signed pfSense's certificate (or that self-signed certificate itself), or a directory of certificates prepared with `openssl rehash`. The service exits at startup if the file cannot be read or loaded. |
 | `ADD_ALIASES_ON_STARTUP` | No       | `false` | Add aliases for currently running labeled containers on startup. |
 | `APPLY_QUIET_SECONDS`    | No       | `10`    | Seconds without a new container event before staged DNS changes are applied together. Applying reloads the pfSense DNS resolver and takes a few seconds, so bursts are batched into one reload. |
 | `APPLY_MAX_WAIT_SECONDS` | No       | `60`    | Upper bound on how long staged changes wait, so continuous container churn cannot delay them indefinitely. |

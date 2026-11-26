@@ -21,6 +21,14 @@ part-way through, such as a proxy whose backend was down. That told operators to
 turn verification off even when it was already off. The underlying error is still
 logged in every case.
 
+### A CA bundle that cannot be loaded now stops the service at startup
+
+`PFSENSE_CA_BUNDLE` was already checked at startup for being readable. A readable file
+that contains no PEM certificate, such as an empty file, a private key, or a certificate
+in DER form, used to let the service start and then fail every request. It now
+exits at startup with a message naming the path and the reason. A directory of
+certificates is still accepted as before.
+
 ## v0.2.1 — 2026-11-01
 
 A maintenance release. There are no code or configuration changes, so upgrading from
