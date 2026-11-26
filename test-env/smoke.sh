@@ -49,8 +49,17 @@ on_exit() {
 }
 trap on_exit EXIT
 
-resolves()     { [[ -n "$(dig +short +timeout=3 "@127.0.0.1" -p "$DNS_PORT" "$1" 2>/dev/null)" ]]; }
-not_resolves() { ! resolves "$1"; }
+# DNS checks have three outcomes, not two: an address, a reply without one, and
+# no reply at all. A timeout must count as neither "resolves" nor "does not
+# resolve". `dig +short` prints its ";; communications error" lines to stdout,
+# so a non-empty output is not an answer -- the first version of these helpers
+# treated a dead resolver as a successful lookup. dig exits 0 only when a server
+# replied, so key on that, and count a line as an answer only if it is an IPv4
+# address.
+lookup()       { dig +short +tries=1 +timeout=3 "@127.0.0.1" -p "$DNS_PORT" "$1" 2>/dev/null; }
+is_address()   { grep -qE '^[0-9]+(\.[0-9]+){3}$'; }
+resolves()     { local out; out="$(lookup "$1")" && is_address <<<"$out"; }
+not_resolves() { local out; out="$(lookup "$1")" && ! is_address <<<"$out"; }
 logged()       { docker logs "$SERVICE" 2>&1 | grep -q "$1"; }
 container_gone() { ! docker inspect "$1" >/dev/null 2>&1; }
 
@@ -76,13 +85,24 @@ assert_within() {
 
 # --------------------------------------------------------------------------
 [[ -f "$LAB_DIR/lab.env" ]] || die "no test environment yet — run ./bootstrap.sh"
-"$TEST_ENV_DIR/vm.sh" status | grep -q running || die "the VM is not running — run ./vm.sh start"
+# Match the whole phrase: a bare "running" also matches "VM not running".
+"$TEST_ENV_DIR/vm.sh" status | grep -q "VM running" || die "the VM is not running — run ./vm.sh start"
 
 if [[ "${1:-}" == "--reset" ]]; then
   log "rolling back to the clean snapshot"
   "$TEST_ENV_DIR/vm.sh" reset clean >/dev/null
-  sleep 5
 fi
+
+# Do not start until the resolver answers. Right after a boot or a rollback,
+# unbound can take tens of seconds to come back, and an apply that lands in that
+# window cannot confirm -- which then reads as a failure of the service.
+log "waiting for the resolver"
+waited=0
+until resolves "$PARENT_HOST.$PARENT_DOMAIN"; do
+  (( waited < 120 )) || die "$PARENT_HOST.$PARENT_DOMAIN did not resolve within 120s; the VM's resolver is not answering"
+  sleep 2
+  waited=$(( waited + 2 ))
+done
 
 "$TEST_ENV_DIR/relay.sh" start >/dev/null
 
@@ -116,7 +136,9 @@ docker run -d --name "$TARGET" \
 assert_within "the service logs the alias as added" 120 logged "$ALIAS_NAME added"
 assert_within "$ALIAS_NAME resolves" 120 resolves "$ALIAS_NAME"
 
-ANSWER="$(dig +short +timeout=3 "@127.0.0.1" -p "$DNS_PORT" "$ALIAS_NAME")"
+# `|| true`: under `set -e`, a timed-out dig would otherwise end the whole run
+# with exit 9 and no message. A timeout is a failed assertion, nothing more.
+ANSWER="$(lookup "$ALIAS_NAME" || true)"
 if [[ "$ANSWER" == "$PARENT_IP" ]]; then
   pass "it resolves to the parent's address ($PARENT_IP)"
 else

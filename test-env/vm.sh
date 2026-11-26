@@ -7,7 +7,7 @@
 #   ./vm.sh kill             terminate QEMU without a clean shutdown
 #   ./vm.sh status           is it running, and are its ports listening
 #   ./vm.sh snapshot [tag]   save a live snapshot, default tag "clean"
-#   ./vm.sh reset [tag]      roll back to a snapshot, about a second
+#   ./vm.sh reset [tag]      roll back to a snapshot and fix the guest clock, a few seconds
 #   ./vm.sh monitor <cmd>    send a raw command to the QEMU monitor
 #
 # Networking is QEMU user-mode (slirp) on both NICs, so this needs no bridge, no
@@ -135,6 +135,27 @@ stop() {
   log "VM stopped"
 }
 
+# Roll back to a snapshot, then bring the guest clock up to date.
+#
+# loadvm restores the clock along with everything else, so a restored guest
+# believes it is still the moment the snapshot was taken -- months ago, for a
+# long-lived "clean" snapshot. pfSense runs unbound-anchor on every DNS resolver
+# apply, and with a stale clock it cannot validate the root trust anchor: it
+# hangs for about 30 seconds and fails, holding unbound down for a minute or more
+# per apply. That made smoke.sh fail at random -- the alias was created, but the
+# apply never confirmed and DNS queries timed out. ntpd will not step an offset
+# that large, so set the clock directly.
+reset() {
+  local tag="$1" tries=0
+  monitor loadvm "$tag"
+  until "$TEST_ENV_DIR/pf.sh" "date -u $(date -u +%Y%m%d%H%M.%S)" >/dev/null 2>&1; do
+    tries=$(( tries + 1 ))
+    (( tries < 10 )) || die "rolled back to '$tag', but could not set the guest clock over SSH"
+    sleep 1
+  done
+  log "rolled back to '$tag'"
+}
+
 case "${1:-status}" in
   start)    start "${2:-}" ;;
   stop)     stop ;;
@@ -148,7 +169,7 @@ case "${1:-status}" in
     fi
     ;;
   snapshot) monitor savevm "${2:-clean}"; log "snapshot '${2:-clean}' saved" ;;
-  reset)    monitor loadvm "${2:-clean}"; log "rolled back to '${2:-clean}'" ;;
+  reset)    reset "${2:-clean}" ;;
   monitor)  shift; monitor "$@" ;;
   *)        die "usage: $0 {start [install]|stop|kill|status|snapshot [tag]|reset [tag]|monitor <cmd>}" ;;
 esac
