@@ -12,6 +12,15 @@ code or configuration changes. This does change the Python and OpenSSL that make
 TLS calls to pfSense, so it was checked end to end against a real pfSense before
 merging.
 
+### The TLS hint no longer fires when pfSense is merely unreachable
+
+The extra log line that names `PFSENSE_CA_BUNDLE` and `PFSENSE_VERIFY_SSL` now appears
+only for a real certificate failure (an untrusted issuer, an expired certificate, or a
+hostname mismatch). Before, it also appeared when a TLS connection was dropped
+part-way through, such as a proxy whose backend was down. That told operators to
+turn verification off even when it was already off. The underlying error is still
+logged in every case.
+
 ## v0.2.1 — 2026-11-01
 
 A maintenance release. There are no code or configuration changes, so upgrading from
