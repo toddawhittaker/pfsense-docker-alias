@@ -54,6 +54,20 @@ With **pfSense Docker Alias**, the **last step** is automated! Simply label your
 - An API key for the pfSense REST API.  
   Generate an API key by following:  [Authentication and Authorization](https://pfrest.org/AUTHENTICATION_AND_AUTHORIZATION/)
 
+## Upgrading to v0.3.0 ⬆️
+
+**v0.3.0 refuses to start if `PFSENSE_CA_BUNDLE` points at a file with no usable certificate in it.** That deployment was already failing every API call; it now stops at startup and says why:
+
+```
+CRITICAL - PFSENSE_CA_BUNDLE '/etc/ssl/certs/pfsense-ca.pem' could not be loaded as a CA
+bundle (...). It must be a PEM file of certificates: the CA that signed pfSense's
+certificate, or that self-signed certificate itself.
+```
+
+The usual causes are an empty file, a private key mounted in place of the certificate, or a certificate converted to DER (binary) form. Export the certificate from pfSense's certificate manager again (pfSense exports PEM), mount it at the same path, and restart. If you do not set `PFSENSE_CA_BUNDLE`, or yours already works, no action is needed. The image now runs Python 3.15. See [CHANGELOG.md](CHANGELOG.md) for everything in this release.
+
+To upgrade on your own schedule rather than whenever `latest` moves, pin a version tag such as `ghcr.io/toddawhittaker/pfsense-docker-alias:v0.3.0`.
+
 ## Upgrading from v0.1.x ⬆️
 
 **v0.2.0 verifies the pfSense TLS certificate by default.** v0.1.2 and earlier disabled verification on every request, with no way to turn it on. Most pfSense installations use a self-signed certificate, so if yours does, every API call will fail after upgrading until you do one of two things.
