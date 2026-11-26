@@ -36,7 +36,7 @@ Finally, check for version references left behind — CI's `setup-python`, `AGEN
 
 ```bash
 gh pr checkout <n>
-uv venv --python 3.14 /tmp/dep-check && VIRTUAL_ENV=/tmp/dep-check uv pip install -r requirements.txt -r requirements-dev.txt
+uv venv --python 3.15 /tmp/dep-check && VIRTUAL_ENV=/tmp/dep-check uv pip install -r requirements.txt -r requirements-dev.txt
 /tmp/dep-check/bin/python -m pytest
 /tmp/dep-check/bin/python -m pip_audit -r requirements.txt --strict
 ```

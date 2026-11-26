@@ -3,6 +3,15 @@
 This project uses semantic versioning. It is still on `0.x`, which means a minor
 release may contain breaking changes — and `v0.2.0` does.
 
+## Unreleased
+
+### The image now runs Python 3.15
+
+The base image moves from `python:3.14-alpine` to `python:3.15-alpine`. There are no
+code or configuration changes. This does change the Python and OpenSSL that make the
+TLS calls to pfSense, so it was checked end to end against a real pfSense before
+merging.
+
 ## v0.2.1 — 2026-11-01
 
 A maintenance release. There are no code or configuration changes, so upgrading from
