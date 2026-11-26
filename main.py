@@ -10,6 +10,7 @@ import sys
 import math
 import time
 import signal
+import ssl
 import logging
 import docker
 import pfsense
@@ -114,6 +115,21 @@ if PFSENSE_CA_BUNDLE and not os.access(PFSENSE_CA_BUNDLE, os.R_OK):
         "Check that the CA bundle is mounted into the container at that path."
     )
     sys.exit(1)
+if PFSENSE_CA_BUNDLE and os.path.isfile(PFSENSE_CA_BUNDLE):
+    # Readable is not enough: an empty file, a key or a DER certificate passes the
+    # check above, and then every request fails with an SSLError
+    # that names no setting. Load it with the same OpenSSL that will use it. A
+    # directory is also valid for requests' `verify` and is not a single file to load,
+    # so it keeps the readability check alone.
+    try:
+        ssl.create_default_context(cafile=PFSENSE_CA_BUNDLE)
+    except (ssl.SSLError, OSError, ValueError) as error:
+        logger.critical(
+            f"PFSENSE_CA_BUNDLE '{PFSENSE_CA_BUNDLE}' could not be loaded as a CA bundle "
+            f"({error}). It must be a PEM file of certificates: the CA that signed "
+            "pfSense's certificate, or that self-signed certificate itself."
+        )
+        sys.exit(1)
 ADD_ALIASES_ON_STARTUP = os.getenv("ADD_ALIASES_ON_STARTUP", "false").lower() == "true"
 # Coalescing: a burst of container events (a compose up) should cost one reload, not
 # one per container. The first change in a quiet period still applies immediately so a
