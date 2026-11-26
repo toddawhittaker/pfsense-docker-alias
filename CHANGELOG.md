@@ -1,14 +1,40 @@
 # Changelog
 
 This project uses semantic versioning. It is still on `0.x`, which means a minor
-release may contain breaking changes — and `v0.2.0` does.
+release may contain breaking changes — and `v0.2.0` and `v0.3.0` do.
 
-## Unreleased
+## v0.3.0 — 2026-11-26
+
+One change can stop a deployment that runs today, which is why this is a minor release
+rather than a patch: **the service now refuses to start if `PFSENSE_CA_BUNDLE` points at
+a file with no usable certificate in it.** Such a deployment was already failing every
+API call, so nothing that worked before stops working; it now fails at startup, with a
+message saying why, instead of running and logging errors. If you do not set
+`PFSENSE_CA_BUNDLE`, or your bundle already works, upgrading needs no action.
+
+The image also moves to Python 3.15, one misleading log line is fixed, and the
+pinned dependencies are up to date.
+
+### Upgrading from v0.2.x
+
+If the service exits straight after starting, check its log for this line:
+
+```
+CRITICAL - PFSENSE_CA_BUNDLE '/etc/ssl/certs/pfsense-ca.pem' could not be loaded as a CA
+bundle ([X509: NO_CERTIFICATE_OR_CRL_FOUND] no certificate or crl found ...). It must be
+a PEM file of certificates: the CA that signed pfSense's certificate, or that
+self-signed certificate itself.
+```
+
+The usual causes are an empty file, a private key mounted in place of the certificate,
+or a certificate converted to DER (binary) form. Export the CA certificate, or the
+self-signed certificate, from pfSense's certificate manager again (pfSense exports PEM),
+mount it at the same path, and restart.
 
 ### The image now runs Python 3.15
 
-The base image moves from `python:3.14-alpine` to `python:3.15-alpine`. There are no
-code or configuration changes. This does change the Python and OpenSSL that make the
+The base image moves from `python:3.14-alpine` to `python:3.15-alpine`. This needs no
+configuration change on its own. It does change the Python and OpenSSL that make the
 TLS calls to pfSense, so it was checked end to end against a real pfSense before
 merging.
 
@@ -28,6 +54,27 @@ that contains no PEM certificate, such as an empty file, a private key, or a cer
 in DER form, used to let the service start and then fail every request. It now
 exits at startup with a message naming the path and the reason. A directory of
 certificates is still accepted as before.
+
+This check proves the file holds a certificate, not that it is the right one. A valid
+bundle for the wrong CA still lets the service start, and then fails each request with
+a certificate error and the TLS hint, as it did before.
+
+### Dependency updates
+
+- `certifi` 2026.10.23 → 2026.11.20. This is the service's trust store when
+  `PFSENSE_CA_BUNDLE` is not set.
+- `charset-normalizer` 3.5.2 → 3.5.3.
+- Development only: `pylint` 4.1.3 → 4.1.4.
+
+`pip-audit` reports no known vulnerabilities in either requirements file.
+
+### For contributors
+
+- CI, the local `.venv` and the docs all use Python 3.15, matching the image.
+- The pfSense test VM's smoke test (`test-env/smoke.sh`) no longer fails at random.
+  Rolling back a VM snapshot also rolled back its clock by months, which made every DNS
+  resolver reload stall for a minute or more. `test-env/vm.sh reset` now sets the
+  clock, and the script's DNS checks no longer mistake a timeout for an answer.
 
 ## v0.2.1 — 2026-11-01
 
