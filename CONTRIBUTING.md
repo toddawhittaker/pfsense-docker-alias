@@ -10,10 +10,10 @@ changing any of them. This file does not repeat it.
 ## Getting set up
 
 The project is two Python modules with no framework and no package layout.
-Python 3.14 matches CI and the runtime image.
+Python 3.15 matches CI and the runtime image.
 
 ```bash
-uv venv --python 3.14
+uv venv --python 3.15
 uv pip install -r requirements.txt -r requirements-dev.txt
 ```
 
